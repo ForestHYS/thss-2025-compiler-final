@@ -1,5 +1,5 @@
-#include "AST/Nodes.h"
-#include "AST/ASTVisitor.h"
+#include "Nodes.h"
+#include "ASTVisitor.h"
 
 namespace sysy {
 

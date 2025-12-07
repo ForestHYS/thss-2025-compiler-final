@@ -1,5 +1,5 @@
-#include "CodeGen/CodeGenerator.h"
-#include "AST/Nodes.h"
+#include "CodeGenerator.h"
+#include "Nodes.h"
 #include <sstream>
 
 namespace sysy {

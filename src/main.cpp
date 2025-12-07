@@ -1,5 +1,5 @@
 #include <iostream>
-#include "Compiler/Compiler.h"
+#include "Compiler.h"
 
 int main(int argc, const char *argv[]) {
   if (argc < 3) {

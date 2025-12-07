@@ -1,9 +1,9 @@
 #pragma once
 
-#include "ASTBuilder/ASTBuilder.h"
-#include "SemanticAnalyzer/SemanticAnalyzer.h"
-#include "CodeGen/CodeGenerator.h"
-#include "SymbolTable/SymbolTable.h"
+#include "ASTBuilder.h"
+#include "SemanticAnalyzer.h"
+#include "CodeGenerator.h"
+#include "SymbolTable.h"
 #include <memory>
 #include <string>
 

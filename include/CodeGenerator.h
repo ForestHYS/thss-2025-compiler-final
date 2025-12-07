@@ -1,15 +1,13 @@
 #pragma once
 
-#include "AST/ASTVisitor.h"
-#include "SymbolTable/SymbolTable.h"
+#include "ASTVisitor.h"
+#include "SymbolTable.h"
+#include "Nodes.h"  // 包含完整定义
 #include <memory>
 #include <string>
 #include <sstream>
 
 namespace sysy {
-
-// 前向声明
-class CompUnitNode;
 
 /**
  * LLVM IR代码生成器

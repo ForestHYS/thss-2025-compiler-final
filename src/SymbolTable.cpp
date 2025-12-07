@@ -1,4 +1,4 @@
-#include "SymbolTable/SymbolTable.h"
+#include "SymbolTable.h"
 #include <iostream>
 
 namespace sysy {

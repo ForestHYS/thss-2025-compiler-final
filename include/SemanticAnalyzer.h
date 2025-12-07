@@ -1,8 +1,8 @@
 #pragma once
 
-#include "AST/ASTVisitor.h"
-#include "SymbolTable/SymbolTable.h"
-#include "AST/Nodes.h"
+#include "ASTVisitor.h"
+#include "SymbolTable.h"
+#include "Nodes.h"
 #include <memory>
 
 namespace sysy {
@@ -18,9 +18,6 @@ private:
     // 辅助方法
     void checkType(ExpNode* exp, DataType expectedType);
     int evaluateConstExp(ConstExpNode* node);
-    
-    // 前向声明
-    class ExpNode;
     
 public:
     SemanticAnalyzer(SymbolTableManager* symTabMgr);

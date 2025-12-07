@@ -1,11 +1,10 @@
-#include "Compiler/Compiler.h"
+#include "Compiler.h"
 #include <fstream>
 #include <sstream>
 #include <antlr4-runtime.h>
-
-// 需要包含生成的ANTLR头文件（假设已生成）
-// #include "antlr/SysYLexer.h"
-// #include "antlr/SysYParser.h"
+// 包含生成的ANTLR头文件（需要先运行 make antlr 生成）
+#include "SysYLexer.h"
+#include "SysYParser.h"
 
 namespace sysy {
 
@@ -45,29 +44,36 @@ bool Compiler::compile(const std::string& inputFile, const std::string& outputFi
 }
 
 std::unique_ptr<CompUnitNode> Compiler::parse(const std::string& inputFile) {
-    // TODO: 实现解析逻辑
-    // 1. 读取输入文件
-    // 2. 创建ANTLR输入流
-    // 3. 创建词法分析器
-    // 4. 创建语法分析器
-    // 5. 获取ParseTree
-    // 6. 使用ASTBuilder构建AST
-    
-    std::ifstream file(inputFile);
-    if (!file.is_open()) {
-        std::cerr << "Error: Cannot open input file: " << inputFile << std::endl;
+    try {
+        // 1. 读取输入文件
+        std::ifstream file(inputFile);
+        if (!file.is_open()) {
+            std::cerr << "Error: Cannot open input file: " << inputFile << std::endl;
+            return nullptr;
+        }
+        
+        // 2. 创建ANTLR输入流
+        antlr4::ANTLRInputStream input(file);
+        
+        // 3. 创建词法分析器
+        SysYLexer lexer(&input);
+        
+        // 4. 创建词法符号流
+        antlr4::CommonTokenStream tokens(&lexer);
+        
+        // 5. 创建语法分析器
+        SysYParser parser(&tokens);
+        
+        // 6. 获取ParseTree（从 compUnit 规则开始解析）
+        antlr4::tree::ParseTree* tree = parser.compUnit();
+        
+        // 7. 使用ASTBuilder构建AST
+        return astBuilder->build(tree);
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error during parsing: " << e.what() << std::endl;
         return nullptr;
     }
-    
-    // TODO: 实际实现需要：
-    // antlr4::ANTLRInputStream input(file);
-    // SysYLexer lexer(&input);
-    // antlr4::CommonTokenStream tokens(&lexer);
-    // SysYParser parser(&tokens);
-    // antlr4::tree::ParseTree* tree = parser.compUnit();
-    // return astBuilder->build(tree);
-    
-    return nullptr;
 }
 
 void Compiler::semanticAnalysis(CompUnitNode* ast) {

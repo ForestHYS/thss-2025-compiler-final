@@ -18,6 +18,15 @@ class CondNode;
 class StmtNode;
 class BlockItemNode;
 class LValNode;
+class ConstDefNode;
+class VarDefNode;
+class ConstInitValNode;
+class InitValNode;
+class FuncFParamNode;
+class BlockStmtNode;
+class MulExpNode;
+class UnaryExpNode;
+class NumberNode;
 
 /**
  * 编译单元节点

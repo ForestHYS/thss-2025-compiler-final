@@ -1,39 +1,6 @@
 #pragma once
 
-// 前向声明所有AST节点类型
-namespace sysy {
-    class CompUnitNode;
-    class ConstDeclNode;
-    class VarDeclNode;
-    class ConstDefNode;
-    class VarDefNode;
-    class ConstInitValNode;
-    class InitValNode;
-    class FuncDefNode;
-    class FuncFParamNode;
-    class BlockStmtNode;
-    class BlockItemNode;
-    class AssignStmtNode;
-    class ExpStmtNode;
-    class IfStmtNode;
-    class WhileStmtNode;
-    class BreakStmtNode;
-    class ContinueStmtNode;
-    class ReturnStmtNode;
-    class AddExpNode;
-    class MulExpNode;
-    class UnaryExpNode;
-    class PrimaryExpNode;
-    class LValNode;
-    class NumberNode;
-    class FuncCallNode;
-    class RelExpNode;
-    class EqExpNode;
-    class LAndExpNode;
-    class LOrExpNode;
-    class CondNode;
-    class ConstExpNode;
-}
+#include "Nodes.h"  // 包含完整定义
 
 namespace sysy {
 

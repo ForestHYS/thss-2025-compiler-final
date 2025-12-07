@@ -1,14 +1,11 @@
 #pragma once
 
+#include "Nodes.h"  // 包含 ConstExpNode 的完整定义
 #include <string>
 #include <vector>
 #include <memory>
 
-
 namespace sysy {
-
-// 前向声明
-class ConstExpNode;
 
 /**
  * 符号类型枚举

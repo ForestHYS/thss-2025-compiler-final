@@ -1,5 +1,5 @@
-#include "SemanticAnalyzer/SemanticAnalyzer.h"
-#include "AST/Nodes.h"
+#include "SemanticAnalyzer.h"
+#include "Nodes.h"
 
 namespace sysy {
 
