@@ -3,6 +3,7 @@
 #include <sstream>
 #include <map>
 #include <iostream>
+#include <algorithm>
 
 namespace sysy
 {
@@ -295,8 +296,7 @@ namespace sysy
                 // 修复：处理数组初始化
                 if (node->initVal)
                 {
-                    std::vector<int> indices;
-                    initializeArrayRecursive(varName, dimensions, node->initVal.get(), 0, indices);
+                    initializeLocalArray(varName, dimensions, node->initVal.get());
                 }
             }
             else
@@ -332,7 +332,7 @@ namespace sysy
         else
         {
             // 数组初始化 - 这个函数现在主要用于表达式求值
-            // 实际的数组初始化在 visitVarDef 中通过 initializeArrayRecursive 处理
+            // 实际的数组初始化在 visitVarDef 中通过 initializeLocalArray 处理
             for (auto &val : node->arrayVals)
             {
                 val->accept(this);
@@ -340,119 +340,130 @@ namespace sysy
         }
     }
     
-    // 数组初始化辅助函数：递归处理多维数组初始化
-    void CodeGenerator::initializeArrayRecursive(const std::string& arrayName, 
-                                                  const std::vector<int>& dimensions,
-                                                  InitValNode* initVal, 
-                                                  int currentDim,
-                                                  std::vector<int>& indices)
+    int CodeGenerator::getTotalElements(const std::vector<int> &dimensions)
     {
-        if (!initVal || currentDim >= static_cast<int>(dimensions.size())) return;
-        
+        int total = 1;
+        for (int dim : dimensions)
+        {
+            total *= dim;
+        }
+        return total;
+    }
+
+    std::vector<int> CodeGenerator::linearToIndices(int linearIndex, const std::vector<int> &dimensions)
+    {
+        std::vector<int> indices(dimensions.size(), 0);
+        int remainder = linearIndex;
+        for (size_t i = 0; i < dimensions.size(); ++i)
+        {
+            int stride = 1;
+            for (size_t j = i + 1; j < dimensions.size(); ++j)
+            {
+                stride *= dimensions[j];
+            }
+            if (stride != 0)
+            {
+                indices[i] = remainder / stride;
+                remainder %= stride;
+            }
+        }
+        return indices;
+    }
+
+    std::string CodeGenerator::emitArrayElementPtr(const std::string &arrayName, const std::vector<int> &dimensions,
+                                                   const std::vector<int> &indices)
+    {
+        std::string ptrReg = "%t" + std::to_string(tempCounter++);
+        irStream << "  " << ptrReg << " = getelementptr ";
+        irStream << getLLVMArrayType(DataType::INT, dimensions);
+        irStream << ", " << getLLVMArrayType(DataType::INT, dimensions) << "* " << arrayName;
+        irStream << ", i32 0";
+        for (int idx : indices)
+        {
+            irStream << ", i32 " << idx;
+        }
+        irStream << "\n";
+        return ptrReg;
+    }
+
+    void CodeGenerator::zeroInitializeArray(const std::string &arrayName, const std::vector<int> &dimensions)
+    {
+        int total = getTotalElements(dimensions);
+        for (int i = 0; i < total; ++i)
+        {
+            std::vector<int> indices = linearToIndices(i, dimensions);
+            std::string ptrReg = emitArrayElementPtr(arrayName, dimensions, indices);
+            irStream << "  store i32 0, i32* " << ptrReg << "\n";
+        }
+    }
+
+    void CodeGenerator::fillArrayFromInit(const std::string &arrayName, const std::vector<int> &dimensions,
+                                          int dimIndex, InitValNode *initVal, int &linearIndex)
+    {
+        if (!initVal)
+            return;
+
+        int total = getTotalElements(dimensions);
+        if (linearIndex >= total)
+            return;
+
+        // 标量：直接写入当前位置
         if (initVal->isScalar)
         {
-            // 标量值：扁平化初始化（如 {1, 2, 3, 4} 用于二维数组）
-            // 需要计算当前标量值应该存储到哪个位置
-            int flatIndex = 0;
-            int multiplier = 1;
-            for (int i = static_cast<int>(indices.size()); i < static_cast<int>(dimensions.size()); ++i)
-            {
-                multiplier *= dimensions[i];
-            }
-            for (size_t i = 0; i < indices.size(); ++i)
-            {
-                int localMultiplier = 1;
-                for (size_t j = i + 1; j < dimensions.size(); ++j)
-                {
-                    localMultiplier *= dimensions[j];
-                }
-                flatIndex += indices[i] * localMultiplier;
-            }
-            
-            // 补齐索引到完整维度
-            std::vector<int> fullIndices = indices;
-            while (static_cast<int>(fullIndices.size()) < static_cast<int>(dimensions.size()))
-            {
-                int remainingFlat = flatIndex;
-                for (size_t i = fullIndices.size() + 1; i < dimensions.size(); ++i)
-                {
-                    remainingFlat /= dimensions[i];
-                }
-                fullIndices.push_back(remainingFlat % dimensions[fullIndices.size()]);
-            }
-            
-            // 计算元素地址
-            std::string ptrReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << ptrReg << " = getelementptr ";
-            irStream << getLLVMArrayType(DataType::INT, dimensions);
-            irStream << ", " << getLLVMArrayType(DataType::INT, dimensions) << "* ";
-            irStream << arrayName;
-            irStream << ", i32 0";
-            for (int idx : fullIndices)
-            {
-                irStream << ", i32 " << idx;
-            }
-            irStream << "\n";
-            
-            // 求值并存储
+            if (!initVal->scalarVal)
+                return;
+            std::vector<int> indices = linearToIndices(linearIndex, dimensions);
+            std::string ptrReg = emitArrayElementPtr(arrayName, dimensions, indices);
             initVal->scalarVal->accept(this);
             irStream << "  store i32 " << currentValue << ", i32* " << ptrReg << "\n";
+            ++linearIndex;
+            return;
         }
-        else
+
+        // 计算当前维度一个元素所占的标量数量，用于对齐到子聚合边界
+        int stride = 1;
+        for (size_t i = dimIndex + 1; i < dimensions.size(); ++i)
         {
-            // 数组值：递归处理
-            int dimSize = dimensions[currentDim];
-            int providedValues = static_cast<int>(initVal->arrayVals.size());
-            
-            for (int i = 0; i < dimSize && i < providedValues; ++i)
+            stride *= dimensions[i];
+        }
+
+        for (auto &childPtr : initVal->arrayVals)
+        {
+            if (linearIndex >= total)
+                break;
+
+            InitValNode *child = childPtr.get();
+            if (!child)
+                continue;
+
+            if (child->isScalar && child->scalarVal)
             {
-                indices.push_back(i);
-                
-                if (currentDim + 1 < static_cast<int>(dimensions.size()))
-                {
-                    // 还有更多维度，继续递归
-                    if (initVal->arrayVals[i]->isScalar)
-                    {
-                        // 扁平化初始化：标量值直接存储
-                        initializeArrayRecursive(arrayName, dimensions, 
-                                                initVal->arrayVals[i].get(), 
-                                                currentDim + 1, indices);
-                    }
-                    else
-                    {
-                        // 嵌套数组初始化
-                        initializeArrayRecursive(arrayName, dimensions, 
-                                                initVal->arrayVals[i].get(), 
-                                                currentDim + 1, indices);
-                    }
-                }
-                else
-                {
-                    // 最后一维，处理标量值
-                    if (initVal->arrayVals[i]->isScalar && initVal->arrayVals[i]->scalarVal)
-                    {
-                        // 计算元素地址
-                        std::string ptrReg = "%t" + std::to_string(tempCounter++);
-                        irStream << "  " << ptrReg << " = getelementptr ";
-                        irStream << getLLVMArrayType(DataType::INT, dimensions);
-                        irStream << ", " << getLLVMArrayType(DataType::INT, dimensions) << "* ";
-                        irStream << arrayName;
-                        irStream << ", i32 0";
-                        for (int idx : indices)
-                        {
-                            irStream << ", i32 " << idx;
-                        }
-                        irStream << "\n";
-                        
-                        // 求值并存储
-                        initVal->arrayVals[i]->scalarVal->accept(this);
-                        irStream << "  store i32 " << currentValue << ", i32* " << ptrReg << "\n";
-                    }
-                }
-                
-                indices.pop_back();
+                std::vector<int> indices = linearToIndices(linearIndex, dimensions);
+                std::string ptrReg = emitArrayElementPtr(arrayName, dimensions, indices);
+                child->scalarVal->accept(this);
+                irStream << "  store i32 " << currentValue << ", i32* " << ptrReg << "\n";
+                ++linearIndex;
+            }
+            else
+            {
+                int base = (linearIndex / stride) * stride;
+                linearIndex = base;
+                fillArrayFromInit(arrayName, dimensions, dimIndex + 1, child, linearIndex);
+                linearIndex = base + stride;
             }
         }
+    }
+
+    void CodeGenerator::initializeLocalArray(const std::string &arrayName, const std::vector<int> &dimensions, InitValNode *initVal)
+    {
+        if (!initVal)
+            return;
+
+        // 先将所有元素置零，保证未提供的值默认为0
+        zeroInitializeArray(arrayName, dimensions);
+
+        int linearIndex = 0;
+        fillArrayFromInit(arrayName, dimensions, 0, initVal, linearIndex);
     }
 
     void CodeGenerator::visitFuncDef(FuncDefNode *node)

@@ -48,10 +48,14 @@ namespace sysy
         int evaluateLVal(LValNode* node);
         
         // 数组初始化辅助函数
-        void initializeArray(const std::string& arrayName, const std::vector<int>& dimensions, 
-                            InitValNode* initVal, int currentDim, int flatIndex);
-        void initializeArrayRecursive(const std::string& arrayName, const std::vector<int>& dimensions,
-                                     InitValNode* initVal, int currentDim, std::vector<int>& indices);
+        int getTotalElements(const std::vector<int>& dimensions);
+        std::vector<int> linearToIndices(int linearIndex, const std::vector<int>& dimensions);
+        std::string emitArrayElementPtr(const std::string& arrayName, const std::vector<int>& dimensions,
+                           const std::vector<int>& indices);
+        void zeroInitializeArray(const std::string& arrayName, const std::vector<int>& dimensions);
+        void initializeLocalArray(const std::string& arrayName, const std::vector<int>& dimensions, InitValNode* initVal);
+        void fillArrayFromInit(const std::string& arrayName, const std::vector<int>& dimensions,
+                       int dimIndex, InitValNode* initVal, int& linearIndex);
 
     public:
         CodeGenerator(SymbolTableManager *symTabMgr);
