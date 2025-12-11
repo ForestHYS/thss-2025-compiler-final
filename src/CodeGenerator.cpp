@@ -145,10 +145,16 @@ namespace sysy
 
             if (isArray && !dimensions.empty())
             {
-                // 全局常量数组 - 生成为 constant
                 std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
-                // 简化处理：使用 zeroinitializer，实际应该根据 initVal 生成具体的初始值
-                irStream << constName << " = constant " << arrayType << " zeroinitializer\n";
+                int total = getTotalElements(dimensions);
+                std::vector<int> values(total, 0);
+                int linearIndex = 0;
+                if (node->initVal)
+                {
+                    fillConstInitVector(dimensions, 0, node->initVal.get(), linearIndex, values);
+                }
+                std::string constAgg = buildArrayConstant(dimensions, values);
+                irStream << constName << " = constant " << arrayType << " " << constAgg << "\n";
             }
             else
             {
@@ -521,6 +527,89 @@ namespace sysy
 
         int linearIndex = 0;
         fillConstArrayFromInit(arrayName, dimensions, 0, initVal, linearIndex);
+    }
+
+    void CodeGenerator::fillConstInitVector(const std::vector<int> &dimensions, int dimIndex,
+                                            ConstInitValNode *initVal, int &linearIndex, std::vector<int> &values)
+    {
+        if (!initVal)
+            return;
+
+        int total = getTotalElements(dimensions);
+        if (linearIndex >= total)
+            return;
+
+        if (initVal->isScalar)
+        {
+            if (!initVal->scalarVal)
+                return;
+            values[linearIndex++] = evaluateConstExp(initVal->scalarVal.get());
+            return;
+        }
+
+        int stride = 1;
+        for (size_t i = dimIndex + 1; i < dimensions.size(); ++i)
+        {
+            stride *= dimensions[i];
+        }
+
+        for (auto &childPtr : initVal->arrayVals)
+        {
+            if (linearIndex >= total)
+                break;
+
+            ConstInitValNode *child = childPtr.get();
+            if (!child)
+                continue;
+
+            if (child->isScalar && child->scalarVal)
+            {
+                values[linearIndex++] = evaluateConstExp(child->scalarVal.get());
+            }
+            else
+            {
+                int base = ((linearIndex + stride - 1) / stride) * stride;
+                linearIndex = base;
+                fillConstInitVector(dimensions, dimIndex + 1, child, linearIndex, values);
+                linearIndex = base + stride;
+            }
+        }
+    }
+
+    std::string CodeGenerator::buildArrayConstantRecursive(const std::vector<int> &dimensions, const std::vector<int> &values,
+                                                           int dimIndex, int &linearIndex)
+    {
+        bool isLast = (dimIndex == static_cast<int>(dimensions.size()) - 1);
+        int count = dimensions[dimIndex];
+        std::ostringstream oss;
+        oss << "[";
+
+        for (int i = 0; i < count; ++i)
+        {
+            if (i > 0)
+                oss << ", ";
+
+            if (isLast)
+            {
+                oss << "i32 " << values[linearIndex++];
+            }
+            else
+            {
+                std::vector<int> subDims(dimensions.begin() + dimIndex + 1, dimensions.end());
+                std::string elemType = getLLVMArrayType(DataType::INT, subDims);
+                std::string sub = buildArrayConstantRecursive(dimensions, values, dimIndex + 1, linearIndex);
+                oss << elemType << " " << sub;
+            }
+        }
+
+        oss << "]";
+        return oss.str();
+    }
+
+    std::string CodeGenerator::buildArrayConstant(const std::vector<int> &dimensions, const std::vector<int> &values)
+    {
+        int idx = 0;
+        return buildArrayConstantRecursive(dimensions, values, 0, idx);
     }
 
     void CodeGenerator::initializeLocalArray(const std::string &arrayName, const std::vector<int> &dimensions, InitValNode *initVal)

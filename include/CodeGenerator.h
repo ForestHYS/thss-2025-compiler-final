@@ -59,6 +59,11 @@ namespace sysy
         void initializeConstLocalArray(const std::string& arrayName, const std::vector<int>& dimensions, ConstInitValNode* initVal);
         void fillConstArrayFromInit(const std::string& arrayName, const std::vector<int>& dimensions,
                         int dimIndex, ConstInitValNode* initVal, int& linearIndex);
+        void fillConstInitVector(const std::vector<int>& dimensions, int dimIndex,
+                     ConstInitValNode* initVal, int& linearIndex, std::vector<int>& values);
+        std::string buildArrayConstant(const std::vector<int>& dimensions, const std::vector<int>& values);
+        std::string buildArrayConstantRecursive(const std::vector<int>& dimensions, const std::vector<int>& values,
+                            int dimIndex, int& linearIndex);
 
     public:
         CodeGenerator(SymbolTableManager *symTabMgr);
