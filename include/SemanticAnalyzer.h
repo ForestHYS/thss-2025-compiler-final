@@ -15,9 +15,28 @@ class SemanticAnalyzer : public ASTVisitor {
 private:
     SymbolTableManager* symbolTableManager;
     
-    // 辅助方法
+    // 当前函数返回类型（用于检查 return 语句）
+    DataType currentFunctionReturnType;
+    
+    // 循环嵌套深度（用于检查 break/continue）
+    int loopDepth;
+    
+    // 错误标志
+    bool hasError;
+    
+    //类型检查
     void checkType(ExpNode* exp, DataType expectedType);
+    
+    //常量表达式求值
     int evaluateConstExp(ConstExpNode* node);
+    int evaluateAddExp(AddExpNode* node);
+    int evaluateMulExp(MulExpNode* node);
+    int evaluateUnaryExp(UnaryExpNode* node);
+    int evaluatePrimaryExp(PrimaryExpNode* node);
+    int evaluateLVal(LValNode* node);
+    
+    //错误报告
+    void reportError(const std::string& message);
     
 public:
     SemanticAnalyzer(SymbolTableManager* symTabMgr);
