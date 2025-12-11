@@ -32,6 +32,9 @@ namespace sysy
         irStream << "; ModuleID = 'sysy_module'\n";
         irStream << "source_filename = \"sysy\"\n\n";
 
+        // 生成系统函数声明
+        generateSystemFunctionDeclarations();
+
         root->accept(this);
 
         return irStream.str();
@@ -255,8 +258,31 @@ namespace sysy
         else
         {
             // 局部变量 - 生成 alloca 指令
+            // 根本性修复：使用唯一的IR名称，避免不同作用域的变量重名
+            // 在LLVM IR中，每个局部变量必须有唯一的名称
             std::string varName = "%" + node->ident;
+            
+            // 为了避免重名（例如不同if分支中的同名变量），我们需要检查并生成唯一名称
+            // 解决方案：使用全局计数器为每个变量名生成唯一后缀
             if (varEntry) {
+                // 使用静态map记录每个变量名在当前函数中出现的次数
+                // 使用作用域指针的地址作为唯一标识
+                static std::map<void*, std::map<std::string, int>> funcVarCounters;
+                void* funcScope = symbolTableManager->getCurrentScope();
+                
+                auto& varCounter = funcVarCounters[funcScope];
+                
+                if (varCounter.find(node->ident) != varCounter.end()) {
+                    // 已经存在同名变量，使用计数器生成唯一名称
+                    int count = varCounter[node->ident];
+                    varCounter[node->ident]++;
+                    varName = "%" + node->ident + std::to_string(count);
+                } else {
+                    // 第一次出现，记录但不添加后缀
+                    varCounter[node->ident] = 1;
+                    varName = "%" + node->ident;
+                }
+                
                 varEntry->irName = varName;
             }
 
@@ -634,27 +660,45 @@ namespace sysy
                     // 局部数组或数组参数
                     if (varEntry->isArray && indexValues.size() > 0)
                     {
-                        // 对于局部数组，需要先load数组基地址（如果是数组参数）
-                        // 或者直接使用 getelementptr（如果是局部数组）
-
-                        // 检查是否为数组参数（通过irName中是否存储了指针）
+                        // 检查是否为数组参数
+                        ParameterEntry *paramEntry = dynamic_cast<ParameterEntry *>(varEntry);
+                        bool isArrayParam = (paramEntry != nullptr && paramEntry->isArrayParam);
+                        
                         std::string basePtr = varEntry->irName;
-
-                        // 生成 getelementptr 指令
-                        irStream << "  " << ptrReg << " = getelementptr ";
-                        irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
-                        irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
-                        irStream << basePtr;
-
-                        // 第一个索引是0
-                        irStream << ", i32 0";
-
-                        // 后续索引
-                        for (const auto &idx : indexValues)
+                        
+                        if (isArrayParam)
                         {
-                            irStream << ", i32 " << idx;
+                            // 数组参数：需要先 load i32* 从 i32** 中
+                            std::string loadedPtr = "%t" + std::to_string(tempCounter++);
+                            irStream << "  " << loadedPtr << " = load i32*, i32** " << basePtr << "\n";
+                            basePtr = loadedPtr;
+                            
+                            // 数组参数：使用 i32* 类型，直接索引
+                            irStream << "  " << ptrReg << " = getelementptr i32, i32* " << basePtr;
+                            for (const auto &idx : indexValues)
+                            {
+                                irStream << ", i32 " << idx;
+                            }
+                            irStream << "\n";
                         }
-                        irStream << "\n";
+                        else
+                        {
+                            // 局部数组：使用数组类型
+                            irStream << "  " << ptrReg << " = getelementptr ";
+                            irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
+                            irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
+                            irStream << basePtr;
+
+                            // 第一个索引是0
+                            irStream << ", i32 0";
+
+                            // 后续索引
+                            for (const auto &idx : indexValues)
+                            {
+                                irStream << ", i32 " << idx;
+                            }
+                            irStream << "\n";
+                        }
                     }
                 }
 
@@ -951,14 +995,54 @@ namespace sysy
 
         if (node->indices.empty())
         {
-            // 标量变量，生成load指令
-            std::string resultReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << resultReg << " = load i32, i32* " << varEntry->irName << "\n";
-            currentValue = resultReg;
+            if (varEntry->isArray)
+            {
+                // 根本性修复：区分数组参数和局部数组
+                ParameterEntry *paramEntry = dynamic_cast<ParameterEntry *>(varEntry);
+                bool isArrayParam = (paramEntry != nullptr && paramEntry->isArrayParam);
+                
+                if (isArrayParam)
+                {
+                    // 数组参数：直接从 i32** load i32*
+                    // 当数组参数作为实参传递给另一个函数时，需要这样处理
+                    std::string resultReg = "%t" + std::to_string(tempCounter++);
+                    irStream << "  " << resultReg << " = load i32*, i32** " << varEntry->irName << "\n";
+                    currentValue = resultReg;
+                }
+                else
+                {
+                    // 局部数组或全局数组：返回指向第一个元素的指针
+                    std::string resultReg = "%t" + std::to_string(tempCounter++);
+                    if (varEntry->getScopeLevel() == 0)
+                    {
+                        // 全局数组
+                        irStream << "  " << resultReg << " = getelementptr ";
+                        irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
+                        irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
+                        irStream << varEntry->irName << ", i32 0, i32 0\n";
+                    }
+                    else
+                    {
+                        // 局部数组
+                        irStream << "  " << resultReg << " = getelementptr ";
+                        irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
+                        irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
+                        irStream << varEntry->irName << ", i32 0, i32 0\n";
+                    }
+                    currentValue = resultReg;
+                }
+            }
+            else
+            {
+                // 标量变量，生成load指令
+                std::string resultReg = "%t" + std::to_string(tempCounter++);
+                irStream << "  " << resultReg << " = load i32, i32* " << varEntry->irName << "\n";
+                currentValue = resultReg;
+            }
         }
         else
         {
-            // 数组元素访问
+            // 数组元素访问或部分索引（多维数组）
             // 计算所有索引表达式
             std::vector<std::string> indexValues;
             for (auto &index : node->indices)
@@ -967,7 +1051,11 @@ namespace sysy
                 indexValues.push_back(currentValue);
             }
 
-            // 生成 getelementptr 指令获取数组元素地址
+            // 根本性修复：判断是否为部分索引（多维数组）
+            // 如果索引数量少于数组维度，则返回子数组指针，不进行load
+            bool isPartialIndex = (indexValues.size() < varEntry->dimensions.size());
+
+            // 生成 getelementptr 指令获取数组元素地址或子数组指针
             std::string ptrReg = "%t" + std::to_string(tempCounter++);
 
             if (varEntry->getScopeLevel() == 0)
@@ -986,31 +1074,82 @@ namespace sysy
                 {
                     irStream << ", i32 " << idx;
                 }
+                
+                // 根本性修复：对于部分索引，添加额外的 ", i32 0" 来获取 i32* 而不是子数组指针
+                // 这样 c[0] 会返回 i32* 而不是 [4 x i32]*
+                if (isPartialIndex)
+                {
+                    irStream << ", i32 0";
+                }
+                
                 irStream << "\n";
             }
             else
             {
-                // 局部数组
-                irStream << "  " << ptrReg << " = getelementptr ";
-                irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
-                irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
-                irStream << varEntry->irName;
-
-                // 第一个索引是0
-                irStream << ", i32 0";
-
-                // 后续索引
-                for (const auto &idx : indexValues)
+                // 局部数组或数组参数
+                // 检查是否为数组参数
+                ParameterEntry *paramEntry = dynamic_cast<ParameterEntry *>(varEntry);
+                bool isArrayParam = (paramEntry != nullptr && paramEntry->isArrayParam);
+                
+                std::string basePtr = varEntry->irName;
+                
+                if (isArrayParam)
                 {
-                    irStream << ", i32 " << idx;
+                    // 数组参数：需要先 load i32* 从 i32** 中
+                    std::string loadedPtr = "%t" + std::to_string(tempCounter++);
+                    irStream << "  " << loadedPtr << " = load i32*, i32** " << basePtr << "\n";
+                    basePtr = loadedPtr;
+                    
+                    // 数组参数：使用 i32* 类型，直接索引
+                    irStream << "  " << ptrReg << " = getelementptr i32, i32* " << basePtr;
+                    for (const auto &idx : indexValues)
+                    {
+                        irStream << ", i32 " << idx;
+                    }
+                    irStream << "\n";
                 }
-                irStream << "\n";
+                else
+                {
+                    // 局部数组：使用数组类型
+                    irStream << "  " << ptrReg << " = getelementptr ";
+                    irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
+                    irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
+                    irStream << basePtr;
+
+                    // 第一个索引是0
+                    irStream << ", i32 0";
+
+                    // 后续索引
+                    for (const auto &idx : indexValues)
+                    {
+                        irStream << ", i32 " << idx;
+                    }
+                    
+                    // 根本性修复：对于部分索引，添加额外的 ", i32 0" 来获取 i32* 而不是子数组指针
+                    if (isPartialIndex)
+                    {
+                        irStream << ", i32 0";
+                    }
+                    
+                    irStream << "\n";
+                }
             }
 
-            // 从数组元素地址加载值
-            std::string resultReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << resultReg << " = load i32, i32* " << ptrReg << "\n";
-            currentValue = resultReg;
+            // 根本性修复：只有在完整索引时才load值
+            // 如果是部分索引（多维数组），返回指针，不load
+            if (isPartialIndex)
+            {
+                // 部分索引：返回 i32* 指针（指向子数组的第一个元素）
+                // 例如：c[0] 其中 c 是 [1024][4]，返回 i32*
+                currentValue = ptrReg;
+            }
+            else
+            {
+                // 完整索引：从数组元素地址加载值
+                std::string resultReg = "%t" + std::to_string(tempCounter++);
+                irStream << "  " << resultReg << " = load i32, i32* " << ptrReg << "\n";
+                currentValue = resultReg;
+            }
         }
     }
 
@@ -1023,32 +1162,60 @@ namespace sysy
     {
         // 查找函数
         FunctionEntry *funcEntry = symbolTableManager->lookupFunction(node->ident);
+        DataType returnType = DataType::VOID;
+        bool isSystemFunc = false;
+        
         if (!funcEntry) {
-            std::cerr << "Error: Function '" << node->ident << "' not found in symbol table" << std::endl;
-            // 设置一个默认返回值，避免后续代码崩溃
-            currentValue = "0";
-            return;
+            // 检查是否为系统函数
+            if (isSystemFunction(node->ident)) {
+                isSystemFunc = true;
+                returnType = getSystemFunctionReturnType(node->ident);
+            } else {
+                std::cerr << "Error: Function '" << node->ident << "' not found in symbol table" << std::endl;
+                // 设置一个默认返回值，避免后续代码崩溃
+                currentValue = "0";
+                return;
+            }
+        } else {
+            returnType = funcEntry->getReturnType();
         }
 
-        // 计算所有参数
+        // 计算所有参数，并确定参数类型
         std::vector<std::string> argValues;
-        for (auto &arg : node->args)
+        std::vector<std::string> argTypes;
+        
+        for (size_t i = 0; i < node->args.size(); ++i)
         {
-            arg->accept(this);
+            node->args[i]->accept(this);
             argValues.push_back(currentValue);
+            
+            // 确定参数类型
+            std::string paramType = "i32";  // 默认类型
+            if (funcEntry && i < static_cast<size_t>(funcEntry->getParameterCount()))
+            {
+                VariableEntry *param = funcEntry->getParameter(static_cast<int>(i));
+                if (param) {
+                    ParameterEntry *paramEntry = dynamic_cast<ParameterEntry *>(param);
+                    if (paramEntry && paramEntry->isArrayParam)
+                    {
+                        paramType = "i32*";  // 数组参数
+                    }
+                }
+            }
+            argTypes.push_back(paramType);
         }
 
         // 生成调用指令
         std::string funcName = "@" + node->ident;
 
-        if (funcEntry->getReturnType() == DataType::VOID)
+        if (returnType == DataType::VOID)
         {
             irStream << "  call void " << funcName << "(";
             for (size_t i = 0; i < argValues.size(); ++i)
             {
                 if (i > 0)
                     irStream << ", ";
-                irStream << "i32 " << argValues[i];
+                irStream << argTypes[i] << " " << argValues[i];
             }
             irStream << ")\n";
             currentValue = "";
@@ -1061,7 +1228,7 @@ namespace sysy
             {
                 if (i > 0)
                     irStream << ", ";
-                irStream << "i32 " << argValues[i];
+                irStream << argTypes[i] << " " << argValues[i];
             }
             irStream << ")\n";
             currentValue = resultReg;
@@ -1353,6 +1520,76 @@ namespace sysy
         }
         
         return 0;
-}
+    }
+
+    // 生成系统函数声明
+    void CodeGenerator::generateSystemFunctionDeclarations()
+    {
+        // 根据 sylib.h 中的定义生成系统函数声明
+        irStream << "; System function declarations\n";
+        irStream << "declare i32 @getint()\n";
+        irStream << "declare i32 @getch()\n";
+        irStream << "declare i32 @getarray(i32*)\n";
+        irStream << "declare void @putint(i32)\n";
+        irStream << "declare void @putch(i32)\n";
+        irStream << "declare void @putarray(i32, i32*)\n";
+        irStream << "\n";
+    }
+
+    // 检查是否为系统函数
+    bool CodeGenerator::isSystemFunction(const std::string &funcName)
+    {
+        return funcName == "getint" || funcName == "getch" || funcName == "getarray" ||
+               funcName == "putint" || funcName == "putch" || funcName == "putarray" ||
+               funcName == "getfloat" || funcName == "getfarray" ||
+               funcName == "putfloat" || funcName == "putfarray" || funcName == "putf" ||
+               funcName == "_sysy_starttime" || funcName == "_sysy_stoptime" ||
+               funcName == "before_main" || funcName == "after_main";
+    }
+
+    // 获取系统函数的返回类型
+    DataType CodeGenerator::getSystemFunctionReturnType(const std::string &funcName)
+    {
+        if (funcName == "getint" || funcName == "getch" || funcName == "getarray" ||
+            funcName == "getfloat" || funcName == "getfarray")
+        {
+            return DataType::INT; // 注意：getfloat 实际返回 float，但当前只支持 int
+        }
+        return DataType::VOID;
+    }
+
+    // 获取系统函数的参数数量
+    int CodeGenerator::getSystemFunctionParamCount(const std::string &funcName)
+    {
+        if (funcName == "getint" || funcName == "getch")
+        {
+            return 0;
+        }
+        else if (funcName == "putint" || funcName == "putch")
+        {
+            return 1;
+        }
+        else if (funcName == "getarray" || funcName == "putfloat")
+        {
+            return 1;
+        }
+        else if (funcName == "putarray" || funcName == "getfarray" || funcName == "putfarray")
+        {
+            return 2;
+        }
+        else if (funcName == "putf")
+        {
+            return -1; // 可变参数
+        }
+        else if (funcName == "_sysy_starttime" || funcName == "_sysy_stoptime")
+        {
+            return 1;
+        }
+        else if (funcName == "before_main" || funcName == "after_main")
+        {
+            return 0;
+        }
+        return 0;
+    }
 
 } // namespace sysy

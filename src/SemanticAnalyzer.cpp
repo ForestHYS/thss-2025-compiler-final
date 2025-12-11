@@ -337,8 +337,51 @@ void SemanticAnalyzer::visitFuncDef(FuncDefNode* node) {
     symbolTableManager->enterFunction(funcPtr);
     currentFunctionReturnType = returnType;
     
-    for (auto& param : node->params) {
-        param->accept(this);
+    // 处理参数：需要同时添加到符号表和函数参数列表
+    for (size_t i = 0; i < node->params.size(); ++i) {
+        auto& param = node->params[i];
+        
+        if (symbolTableManager->getCurrentScope()->contains(param->ident)) {
+            reportError("Redefinition of parameter: " + param->ident);
+            continue;
+        }
+        
+        // 创建参数条目
+        auto paramEntry = std::make_unique<ParameterEntry>(
+            param->ident,
+            param->isArray ? DataType::INT_ARRAY : DataType::INT,
+            symbolTableManager->getCurrentScope()->getScopeLevel(),
+            static_cast<int>(i)
+        );
+        
+        paramEntry->isArrayParam = param->isArray;
+        paramEntry->isArray = param->isArray;
+        
+        // 处理数组参数的维度
+        if (param->isArray && !param->dims.empty()) {
+            for (auto& dim : param->dims) {
+                if (dim) {
+                    dim->accept(this);
+                }
+            }
+        }
+        
+        // 关键修复：将参数添加到函数参数列表
+        // 创建副本用于函数参数列表
+        auto paramForFunc = std::make_unique<ParameterEntry>(
+            paramEntry->name,
+            paramEntry->dataType,
+            paramEntry->scopeLevel,
+            paramEntry->paramIndex
+        );
+        paramForFunc->isArrayParam = paramEntry->isArrayParam;
+        paramForFunc->isArray = paramEntry->isArray;
+        funcPtr->addParameter(std::move(paramForFunc));
+        
+        // 添加到符号表
+        if (!symbolTableManager->insertParameter(std::move(paramEntry))) {
+            reportError("Failed to insert parameter: " + param->ident);
+        }
     }
     
     if (node->block) {
@@ -349,33 +392,9 @@ void SemanticAnalyzer::visitFuncDef(FuncDefNode* node) {
 }
 
 void SemanticAnalyzer::visitFuncFParam(FuncFParamNode* node) {
-    if (symbolTableManager->getCurrentScope()->contains(node->ident)) {
-        reportError("Redefinition of parameter: " + node->ident);
-        return;
-    }
-    
-    // TODO: 需要从外部传入 paramIndex
-    auto paramEntry = std::make_unique<ParameterEntry>(
-        node->ident,
-        node->isArray ? DataType::INT_ARRAY : DataType::INT,
-        symbolTableManager->getCurrentScope()->getScopeLevel(),
-        0
-    );
-    
-    paramEntry->isArrayParam = node->isArray;
-    paramEntry->isArray = node->isArray;
-    
-    if (node->isArray && !node->dims.empty()) {
-        for (auto& dim : node->dims) {
-            if (dim) {
-                dim->accept(this);
-            }
-        }
-    }
-    
-    if (!symbolTableManager->insertParameter(std::move(paramEntry))) {
-        reportError("Failed to insert parameter: " + node->ident);
-    }
+    // 参数处理已经在 visitFuncDef 中完成
+    // 这个函数现在只是一个占位符，实际处理在父函数中
+    // 保留此函数以保持访问者模式的完整性
 }
 
 void SemanticAnalyzer::visitBlockStmt(BlockStmtNode* node) {
