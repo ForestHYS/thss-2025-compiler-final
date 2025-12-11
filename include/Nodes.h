@@ -27,6 +27,8 @@ class BlockStmtNode;
 class MulExpNode;
 class UnaryExpNode;
 class NumberNode;
+class PrimaryExpNode;
+class FuncCallNode;
 
 /**
  * 编译单元节点
@@ -301,7 +303,9 @@ public:
 class UnaryExpNode : public ExpNode {
 public:
     UnaryOp op;
-    std::unique_ptr<UnaryExpNode> operand;  // 递归结构，最终指向PrimaryExpNode
+    std::unique_ptr<UnaryExpNode> operand;  // 递归结构，用于一元运算符
+    std::unique_ptr<PrimaryExpNode> primaryExp;  // 当没有一元运算符时，直接存储 PrimaryExp
+    std::unique_ptr<FuncCallNode> funcCall;  // 函数调用
     
     void accept(ASTVisitor* visitor) override;
     std::string getNodeType() const override { return "UnaryExp"; }

@@ -2,6 +2,7 @@
 #include "Nodes.h"
 #include <sstream>
 #include <map>
+#include <iostream>
 
 namespace sysy
 {
@@ -30,6 +31,9 @@ namespace sysy
         // 生成模块头部
         irStream << "; ModuleID = 'sysy_module'\n";
         irStream << "source_filename = \"sysy\"\n\n";
+
+        // 生成系统函数声明
+        generateSystemFunctionDeclarations();
 
         root->accept(this);
 
@@ -109,26 +113,39 @@ namespace sysy
 
     void CodeGenerator::visitConstDef(ConstDefNode *node)
     {
-        // 查找符号表条目
-        SymbolEntry *entry = symbolTableManager->lookup(node->ident);
-        if (!entry)
-            return;
-
+        // 尝试从符号表获取类型信息（可选，用于获取维度信息）
+        SymbolEntry *entry = symbolTableManager->getCurrentScope()->lookup(node->ident);
+        if (!entry) {
+            entry = symbolTableManager->lookup(node->ident);
+        }
+        
         VariableEntry *constEntry = dynamic_cast<VariableEntry *>(entry);
-        if (!constEntry)
-            return;
-
-        // 判断是全局还是局部常量
-        if (constEntry->getScopeLevel() == 0)
+        
+        // 关键修复：基于当前代码生成上下文判断，而不是符号表中变量的 scopeLevel
+        int currentScopeLevel = symbolTableManager->getCurrentScope()->getScopeLevel();
+        bool isGlobal = (currentScopeLevel == 0);
+        
+        std::vector<int> dimensions;
+        bool isArray = !node->dims.empty();
+        
+        if (constEntry) {
+            // 从符号表获取维度信息
+            dimensions = constEntry->dimensions;
+            isArray = constEntry->isArray;
+        }
+        
+        if (isGlobal)
         {
             // 全局常量 - 生成为全局常量
             std::string constName = "@" + node->ident;
-            constEntry->irName = constName;
+            if (constEntry) {
+                constEntry->irName = constName;
+            }
 
-            if (constEntry->isArray)
+            if (isArray && !dimensions.empty())
             {
                 // 全局常量数组 - 生成为 constant
-                std::string arrayType = getLLVMArrayType(DataType::INT, constEntry->dimensions);
+                std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
                 // 简化处理：使用 zeroinitializer，实际应该根据 initVal 生成具体的初始值
                 irStream << constName << " = constant " << arrayType << " zeroinitializer\n";
             }
@@ -151,12 +168,14 @@ namespace sysy
             // 对于局部常量，可以选择生成 alloca 并标记为只读
             // 或者完全通过符号表内联（当前采用生成 alloca 的方式）
             std::string constName = "%" + node->ident;
-            constEntry->irName = constName;
+            if (constEntry) {
+                constEntry->irName = constName;
+            }
 
-            if (constEntry->isArray)
+            if (isArray && !dimensions.empty())
             {
                 // 局部常量数组
-                std::string arrayType = getLLVMArrayType(DataType::INT, constEntry->dimensions);
+                std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
                 irStream << "  " << constName << " = alloca " << arrayType << "\n";
                 // 可以添加初始化逻辑
             }
@@ -176,36 +195,62 @@ namespace sysy
 
     void CodeGenerator::visitVarDef(VarDefNode *node)
     {
-        // 查找符号表条目
-        SymbolEntry *entry = symbolTableManager->lookup(node->ident);
-        if (!entry)
-            return;
-
+        // 尝试从符号表获取类型信息（可选，用于获取维度信息）
+        SymbolEntry *entry = symbolTableManager->getCurrentScope()->lookup(node->ident);
+        if (!entry) {
+            entry = symbolTableManager->lookup(node->ident);
+        }
+        
         VariableEntry *varEntry = dynamic_cast<VariableEntry *>(entry);
-        if (!varEntry)
-            return;
-
-        // 判断是全局还是局部变量
-        if (varEntry->getScopeLevel() == 0)
+        
+        // 关键修复：基于当前代码生成上下文判断，而不是符号表中变量的 scopeLevel
+        // 如果当前作用域的 scopeLevel == 0，说明在全局作用域，生成 global
+        // 如果当前作用域的 scopeLevel > 0，说明在函数内部，生成 alloca
+        int currentScopeLevel = symbolTableManager->getCurrentScope()->getScopeLevel();
+        bool isGlobal = (currentScopeLevel == 0);
+        
+        std::vector<int> dimensions;
+        bool isArray = !node->dims.empty();
+        
+        if (varEntry) {
+            // 从符号表获取维度信息
+            dimensions = varEntry->dimensions;
+            isArray = varEntry->isArray;
+        }
+        
+        if (isGlobal)
         {
             // 全局变量
             std::string varName = "@" + node->ident;
-            varEntry->irName = varName;
+            if (varEntry) {
+                varEntry->irName = varName;
+            }
 
-            if (varEntry->isArray)
+            if (isArray && !dimensions.empty())
             {
                 // 全局数组
-                std::string arrayType = getLLVMArrayType(DataType::INT, varEntry->dimensions);
+                std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
                 irStream << varName << " = global " << arrayType << " zeroinitializer\n";
             }
             else
             {
                 // 全局标量
                 int initValue = 0;
-                if (node->initVal)
+                if (node->initVal && node->initVal->isScalar && node->initVal->scalarVal)
                 {
-                    // 如果有初始值，需要求值（简化处理，假设为0）
-                    // 实际应该执行常量求值
+                    // 全局变量的初始值必须是常量表达式
+                    // ExpNode 实际上就是 AddExpNode（因为 exp: addExp）
+                    AddExpNode* addExp = dynamic_cast<AddExpNode*>(node->initVal->scalarVal.get());
+                    if (addExp)
+                    {
+                        initValue = evaluateAddExp(addExp);
+                    }
+                    else
+                    {
+                        std::cerr << "Warning: Global variable '" << node->ident 
+                                  << "' has invalid initializer, using 0" << std::endl;
+                        initValue = 0;
+                    }
                 }
                 irStream << varName << " = global i32 " << initValue << "\n";
             }
@@ -213,14 +258,46 @@ namespace sysy
         else
         {
             // 局部变量 - 生成 alloca 指令
+            // 根本性修复：使用唯一的IR名称，避免不同作用域的变量重名
+            // 在LLVM IR中，每个局部变量必须有唯一的名称
             std::string varName = "%" + node->ident;
-            varEntry->irName = varName;
+            
+            // 为了避免重名（例如不同if分支中的同名变量），我们需要检查并生成唯一名称
+            // 解决方案：使用全局计数器为每个变量名生成唯一后缀
+            if (varEntry) {
+                // 使用静态map记录每个变量名在当前函数中出现的次数
+                // 使用作用域指针的地址作为唯一标识
+                static std::map<void*, std::map<std::string, int>> funcVarCounters;
+                void* funcScope = symbolTableManager->getCurrentScope();
+                
+                auto& varCounter = funcVarCounters[funcScope];
+                
+                if (varCounter.find(node->ident) != varCounter.end()) {
+                    // 已经存在同名变量，使用计数器生成唯一名称
+                    int count = varCounter[node->ident];
+                    varCounter[node->ident]++;
+                    varName = "%" + node->ident + std::to_string(count);
+                } else {
+                    // 第一次出现，记录但不添加后缀
+                    varCounter[node->ident] = 1;
+                    varName = "%" + node->ident;
+                }
+                
+                varEntry->irName = varName;
+            }
 
-            if (varEntry->isArray)
+            if (isArray && !dimensions.empty())
             {
                 // 局部数组
-                std::string arrayType = getLLVMArrayType(DataType::INT, varEntry->dimensions);
+                std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
                 irStream << "  " << varName << " = alloca " << arrayType << "\n";
+                
+                // 修复：处理数组初始化
+                if (node->initVal)
+                {
+                    std::vector<int> indices;
+                    initializeArrayRecursive(varName, dimensions, node->initVal.get(), 0, indices);
+                }
             }
             else
             {
@@ -254,10 +331,126 @@ namespace sysy
         }
         else
         {
-            // 数组初始化 - 简化处理
+            // 数组初始化 - 这个函数现在主要用于表达式求值
+            // 实际的数组初始化在 visitVarDef 中通过 initializeArrayRecursive 处理
             for (auto &val : node->arrayVals)
             {
                 val->accept(this);
+            }
+        }
+    }
+    
+    // 数组初始化辅助函数：递归处理多维数组初始化
+    void CodeGenerator::initializeArrayRecursive(const std::string& arrayName, 
+                                                  const std::vector<int>& dimensions,
+                                                  InitValNode* initVal, 
+                                                  int currentDim,
+                                                  std::vector<int>& indices)
+    {
+        if (!initVal || currentDim >= static_cast<int>(dimensions.size())) return;
+        
+        if (initVal->isScalar)
+        {
+            // 标量值：扁平化初始化（如 {1, 2, 3, 4} 用于二维数组）
+            // 需要计算当前标量值应该存储到哪个位置
+            int flatIndex = 0;
+            int multiplier = 1;
+            for (int i = static_cast<int>(indices.size()); i < static_cast<int>(dimensions.size()); ++i)
+            {
+                multiplier *= dimensions[i];
+            }
+            for (size_t i = 0; i < indices.size(); ++i)
+            {
+                int localMultiplier = 1;
+                for (size_t j = i + 1; j < dimensions.size(); ++j)
+                {
+                    localMultiplier *= dimensions[j];
+                }
+                flatIndex += indices[i] * localMultiplier;
+            }
+            
+            // 补齐索引到完整维度
+            std::vector<int> fullIndices = indices;
+            while (static_cast<int>(fullIndices.size()) < static_cast<int>(dimensions.size()))
+            {
+                int remainingFlat = flatIndex;
+                for (size_t i = fullIndices.size() + 1; i < dimensions.size(); ++i)
+                {
+                    remainingFlat /= dimensions[i];
+                }
+                fullIndices.push_back(remainingFlat % dimensions[fullIndices.size()]);
+            }
+            
+            // 计算元素地址
+            std::string ptrReg = "%t" + std::to_string(tempCounter++);
+            irStream << "  " << ptrReg << " = getelementptr ";
+            irStream << getLLVMArrayType(DataType::INT, dimensions);
+            irStream << ", " << getLLVMArrayType(DataType::INT, dimensions) << "* ";
+            irStream << arrayName;
+            irStream << ", i32 0";
+            for (int idx : fullIndices)
+            {
+                irStream << ", i32 " << idx;
+            }
+            irStream << "\n";
+            
+            // 求值并存储
+            initVal->scalarVal->accept(this);
+            irStream << "  store i32 " << currentValue << ", i32* " << ptrReg << "\n";
+        }
+        else
+        {
+            // 数组值：递归处理
+            int dimSize = dimensions[currentDim];
+            int providedValues = static_cast<int>(initVal->arrayVals.size());
+            
+            for (int i = 0; i < dimSize && i < providedValues; ++i)
+            {
+                indices.push_back(i);
+                
+                if (currentDim + 1 < static_cast<int>(dimensions.size()))
+                {
+                    // 还有更多维度，继续递归
+                    if (initVal->arrayVals[i]->isScalar)
+                    {
+                        // 扁平化初始化：标量值直接存储
+                        initializeArrayRecursive(arrayName, dimensions, 
+                                                initVal->arrayVals[i].get(), 
+                                                currentDim + 1, indices);
+                    }
+                    else
+                    {
+                        // 嵌套数组初始化
+                        initializeArrayRecursive(arrayName, dimensions, 
+                                                initVal->arrayVals[i].get(), 
+                                                currentDim + 1, indices);
+                    }
+                }
+                else
+                {
+                    // 最后一维，处理标量值
+                    if (initVal->arrayVals[i]->isScalar && initVal->arrayVals[i]->scalarVal)
+                    {
+                        // 计算元素地址
+                        std::string ptrReg = "%t" + std::to_string(tempCounter++);
+                        irStream << "  " << ptrReg << " = getelementptr ";
+                        irStream << getLLVMArrayType(DataType::INT, dimensions);
+                        irStream << ", " << getLLVMArrayType(DataType::INT, dimensions) << "* ";
+                        irStream << arrayName;
+                        irStream << ", i32 0";
+                        for (int idx : indices)
+                        {
+                            irStream << ", i32 " << idx;
+                        }
+                        irStream << "\n";
+                        
+                        // 求值并存储
+                        initVal->arrayVals[i]->scalarVal->accept(this);
+                        irStream << "  store i32 " << currentValue << ", i32* " << ptrReg << "\n";
+                    }
+                }
+                
+                indices.pop_back();
             }
         }
     }
@@ -266,8 +459,13 @@ namespace sysy
     {
         // 查找函数符号表条目
         FunctionEntry *funcEntry = symbolTableManager->lookupFunction(node->ident);
-        if (!funcEntry)
+        if (!funcEntry) {
+            std::cerr << "Error: Function '" << node->ident << "' not found in symbol table" << std::endl;
             return;
+        }
+
+        // 关键修复：进入函数作用域，这样函数内部的变量会生成 alloca 而不是 global
+        symbolTableManager->enterFunction(funcEntry);
 
         // 生成函数签名
         std::string funcName = "@" + node->ident;
@@ -334,18 +532,25 @@ namespace sysy
         }
 
         irStream << "}\n";
+        
+        // 关键修复：退出函数作用域
+        symbolTableManager->exitFunction();
     }
 
     void CodeGenerator::visitFuncFParam(FuncFParamNode *node)
     {
         // 查找符号表条目
         SymbolEntry *paramEntry = symbolTableManager->lookup(node->ident);
-        if (!paramEntry)
+        if (!paramEntry) {
+            std::cerr << "Error: Parameter '" << node->ident << "' not found in symbol table" << std::endl;
             return;
+        }
 
         VariableEntry *varEntry = dynamic_cast<VariableEntry *>(paramEntry);
-        if (!varEntry)
+        if (!varEntry) {
+            std::cerr << "Error: '" << node->ident << "' is not a variable" << std::endl;
             return;
+        }
 
         // 生成参数的局部变量名
         std::string paramName = "%" + node->ident;
@@ -396,12 +601,22 @@ namespace sysy
 
             // 获取左值地址
             SymbolEntry *entry = symbolTableManager->lookup(node->lVal->ident);
-            if (!entry)
+            if (!entry) {
+                std::cerr << "Error: Variable '" << node->lVal->ident << "' not found in symbol table" << std::endl;
                 return;
+            }
 
             VariableEntry *varEntry = dynamic_cast<VariableEntry *>(entry);
-            if (!varEntry)
+            if (!varEntry) {
+                std::cerr << "Error: '" << node->lVal->ident << "' is not a variable" << std::endl;
                 return;
+            }
+            
+            // 检查变量是否已经生成了IR名称（即是否已经定义了）
+            if (varEntry->irName.empty()) {
+                std::cerr << "Error: Variable '" << node->lVal->ident << "' has not been defined (no IR name)" << std::endl;
+                return;
+            }
 
             if (node->lVal->indices.empty())
             {
@@ -445,27 +660,45 @@ namespace sysy
                     // 局部数组或数组参数
                     if (varEntry->isArray && indexValues.size() > 0)
                     {
-                        // 对于局部数组，需要先load数组基地址（如果是数组参数）
-                        // 或者直接使用 getelementptr（如果是局部数组）
-
-                        // 检查是否为数组参数（通过irName中是否存储了指针）
+                        // 检查是否为数组参数
+                        ParameterEntry *paramEntry = dynamic_cast<ParameterEntry *>(varEntry);
+                        bool isArrayParam = (paramEntry != nullptr && paramEntry->isArrayParam);
+                        
                         std::string basePtr = varEntry->irName;
-
-                        // 生成 getelementptr 指令
-                        irStream << "  " << ptrReg << " = getelementptr ";
-                        irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
-                        irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
-                        irStream << basePtr;
-
-                        // 第一个索引是0
-                        irStream << ", i32 0";
-
-                        // 后续索引
-                        for (const auto &idx : indexValues)
+                        
+                        if (isArrayParam)
                         {
-                            irStream << ", i32 " << idx;
+                            // 数组参数：需要先 load i32* 从 i32** 中
+                            std::string loadedPtr = "%t" + std::to_string(tempCounter++);
+                            irStream << "  " << loadedPtr << " = load i32*, i32** " << basePtr << "\n";
+                            basePtr = loadedPtr;
+                            
+                            // 数组参数：使用 i32* 类型，直接索引
+                            irStream << "  " << ptrReg << " = getelementptr i32, i32* " << basePtr;
+                            for (const auto &idx : indexValues)
+                            {
+                                irStream << ", i32 " << idx;
+                            }
+                            irStream << "\n";
                         }
-                        irStream << "\n";
+                        else
+                        {
+                            // 局部数组：使用数组类型
+                            irStream << "  " << ptrReg << " = getelementptr ";
+                            irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
+                            irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
+                            irStream << basePtr;
+
+                            // 第一个索引是0
+                            irStream << ", i32 0";
+
+                            // 后续索引
+                            for (const auto &idx : indexValues)
+                            {
+                                irStream << ", i32 " << idx;
+                            }
+                            irStream << "\n";
+                        }
                     }
                 }
 
@@ -594,6 +827,12 @@ namespace sysy
         if (node->exp)
         {
             node->exp->accept(this);
+            // 确保 currentValue 不为空
+            if (currentValue.empty()) {
+                // 如果表达式访问没有设置 currentValue，使用默认值 0
+                // 这通常不应该发生，但作为安全措施
+                currentValue = "0";
+            }
             irStream << "  ret i32 " << currentValue << "\n";
         }
         else
@@ -699,6 +938,16 @@ namespace sysy
                 currentValue = extReg;
             }
         }
+        else if (node->primaryExp)
+        {
+            // 没有一元运算符，直接访问 PrimaryExp
+            node->primaryExp->accept(this);
+        }
+        else if (node->funcCall)
+        {
+            // 函数调用
+            node->funcCall->accept(this);
+        }
     }
 
     void CodeGenerator::visitPrimaryExp(PrimaryExpNode *node)
@@ -721,23 +970,79 @@ namespace sysy
     {
         // 查找符号表条目
         SymbolEntry *entry = symbolTableManager->lookup(node->ident);
-        if (!entry)
+        if (!entry) {
+            std::cerr << "Error: Variable '" << node->ident << "' not found in symbol table" << std::endl;
+            // 设置一个默认值，避免后续代码崩溃
+            currentValue = "0";
             return;
+        }
 
         VariableEntry *varEntry = dynamic_cast<VariableEntry *>(entry);
-        if (!varEntry)
+        if (!varEntry) {
+            std::cerr << "Error: '" << node->ident << "' is not a variable" << std::endl;
+            // 设置一个默认值，避免后续代码崩溃
+            currentValue = "0";
             return;
+        }
+        
+        // 检查变量是否已经生成了IR名称（即是否已经定义了）
+        if (varEntry->irName.empty()) {
+            std::cerr << "Error: Variable '" << node->ident << "' has not been defined (no IR name)" << std::endl;
+            // 设置一个默认值，避免后续代码崩溃
+            currentValue = "0";
+            return;
+        }
 
         if (node->indices.empty())
         {
-            // 标量变量，生成load指令
-            std::string resultReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << resultReg << " = load i32, i32* " << varEntry->irName << "\n";
-            currentValue = resultReg;
+            if (varEntry->isArray)
+            {
+                // 根本性修复：区分数组参数和局部数组
+                ParameterEntry *paramEntry = dynamic_cast<ParameterEntry *>(varEntry);
+                bool isArrayParam = (paramEntry != nullptr && paramEntry->isArrayParam);
+                
+                if (isArrayParam)
+                {
+                    // 数组参数：直接从 i32** load i32*
+                    // 当数组参数作为实参传递给另一个函数时，需要这样处理
+                    std::string resultReg = "%t" + std::to_string(tempCounter++);
+                    irStream << "  " << resultReg << " = load i32*, i32** " << varEntry->irName << "\n";
+                    currentValue = resultReg;
+                }
+                else
+                {
+                    // 局部数组或全局数组：返回指向第一个元素的指针
+                    std::string resultReg = "%t" + std::to_string(tempCounter++);
+                    if (varEntry->getScopeLevel() == 0)
+                    {
+                        // 全局数组
+                        irStream << "  " << resultReg << " = getelementptr ";
+                        irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
+                        irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
+                        irStream << varEntry->irName << ", i32 0, i32 0\n";
+                    }
+                    else
+                    {
+                        // 局部数组
+                        irStream << "  " << resultReg << " = getelementptr ";
+                        irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
+                        irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
+                        irStream << varEntry->irName << ", i32 0, i32 0\n";
+                    }
+                    currentValue = resultReg;
+                }
+            }
+            else
+            {
+                // 标量变量，生成load指令
+                std::string resultReg = "%t" + std::to_string(tempCounter++);
+                irStream << "  " << resultReg << " = load i32, i32* " << varEntry->irName << "\n";
+                currentValue = resultReg;
+            }
         }
         else
         {
-            // 数组元素访问
+            // 数组元素访问或部分索引（多维数组）
             // 计算所有索引表达式
             std::vector<std::string> indexValues;
             for (auto &index : node->indices)
@@ -746,7 +1051,11 @@ namespace sysy
                 indexValues.push_back(currentValue);
             }
 
-            // 生成 getelementptr 指令获取数组元素地址
+            // 根本性修复：判断是否为部分索引（多维数组）
+            // 如果索引数量少于数组维度，则返回子数组指针，不进行load
+            bool isPartialIndex = (indexValues.size() < varEntry->dimensions.size());
+
+            // 生成 getelementptr 指令获取数组元素地址或子数组指针
             std::string ptrReg = "%t" + std::to_string(tempCounter++);
 
             if (varEntry->getScopeLevel() == 0)
@@ -765,31 +1074,82 @@ namespace sysy
                 {
                     irStream << ", i32 " << idx;
                 }
+                
+                // 根本性修复：对于部分索引，添加额外的 ", i32 0" 来获取 i32* 而不是子数组指针
+                // 这样 c[0] 会返回 i32* 而不是 [4 x i32]*
+                if (isPartialIndex)
+                {
+                    irStream << ", i32 0";
+                }
+                
                 irStream << "\n";
             }
             else
             {
-                // 局部数组
-                irStream << "  " << ptrReg << " = getelementptr ";
-                irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
-                irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
-                irStream << varEntry->irName;
-
-                // 第一个索引是0
-                irStream << ", i32 0";
-
-                // 后续索引
-                for (const auto &idx : indexValues)
+                // 局部数组或数组参数
+                // 检查是否为数组参数
+                ParameterEntry *paramEntry = dynamic_cast<ParameterEntry *>(varEntry);
+                bool isArrayParam = (paramEntry != nullptr && paramEntry->isArrayParam);
+                
+                std::string basePtr = varEntry->irName;
+                
+                if (isArrayParam)
                 {
-                    irStream << ", i32 " << idx;
+                    // 数组参数：需要先 load i32* 从 i32** 中
+                    std::string loadedPtr = "%t" + std::to_string(tempCounter++);
+                    irStream << "  " << loadedPtr << " = load i32*, i32** " << basePtr << "\n";
+                    basePtr = loadedPtr;
+                    
+                    // 数组参数：使用 i32* 类型，直接索引
+                    irStream << "  " << ptrReg << " = getelementptr i32, i32* " << basePtr;
+                    for (const auto &idx : indexValues)
+                    {
+                        irStream << ", i32 " << idx;
+                    }
+                    irStream << "\n";
                 }
-                irStream << "\n";
+                else
+                {
+                    // 局部数组：使用数组类型
+                    irStream << "  " << ptrReg << " = getelementptr ";
+                    irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
+                    irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
+                    irStream << basePtr;
+
+                    // 第一个索引是0
+                    irStream << ", i32 0";
+
+                    // 后续索引
+                    for (const auto &idx : indexValues)
+                    {
+                        irStream << ", i32 " << idx;
+                    }
+                    
+                    // 根本性修复：对于部分索引，添加额外的 ", i32 0" 来获取 i32* 而不是子数组指针
+                    if (isPartialIndex)
+                    {
+                        irStream << ", i32 0";
+                    }
+                    
+                    irStream << "\n";
+                }
             }
 
-            // 从数组元素地址加载值
-            std::string resultReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << resultReg << " = load i32, i32* " << ptrReg << "\n";
-            currentValue = resultReg;
+            // 根本性修复：只有在完整索引时才load值
+            // 如果是部分索引（多维数组），返回指针，不load
+            if (isPartialIndex)
+            {
+                // 部分索引：返回 i32* 指针（指向子数组的第一个元素）
+                // 例如：c[0] 其中 c 是 [1024][4]，返回 i32*
+                currentValue = ptrReg;
+            }
+            else
+            {
+                // 完整索引：从数组元素地址加载值
+                std::string resultReg = "%t" + std::to_string(tempCounter++);
+                irStream << "  " << resultReg << " = load i32, i32* " << ptrReg << "\n";
+                currentValue = resultReg;
+            }
         }
     }
 
@@ -802,28 +1162,60 @@ namespace sysy
     {
         // 查找函数
         FunctionEntry *funcEntry = symbolTableManager->lookupFunction(node->ident);
-        if (!funcEntry)
-            return;
+        DataType returnType = DataType::VOID;
+        bool isSystemFunc = false;
+        
+        if (!funcEntry) {
+            // 检查是否为系统函数
+            if (isSystemFunction(node->ident)) {
+                isSystemFunc = true;
+                returnType = getSystemFunctionReturnType(node->ident);
+            } else {
+                std::cerr << "Error: Function '" << node->ident << "' not found in symbol table" << std::endl;
+                // 设置一个默认返回值，避免后续代码崩溃
+                currentValue = "0";
+                return;
+            }
+        } else {
+            returnType = funcEntry->getReturnType();
+        }
 
-        // 计算所有参数
+        // 计算所有参数，并确定参数类型
         std::vector<std::string> argValues;
-        for (auto &arg : node->args)
+        std::vector<std::string> argTypes;
+        
+        for (size_t i = 0; i < node->args.size(); ++i)
         {
-            arg->accept(this);
+            node->args[i]->accept(this);
             argValues.push_back(currentValue);
+            
+            // 确定参数类型
+            std::string paramType = "i32";  // 默认类型
+            if (funcEntry && i < static_cast<size_t>(funcEntry->getParameterCount()))
+            {
+                VariableEntry *param = funcEntry->getParameter(static_cast<int>(i));
+                if (param) {
+                    ParameterEntry *paramEntry = dynamic_cast<ParameterEntry *>(param);
+                    if (paramEntry && paramEntry->isArrayParam)
+                    {
+                        paramType = "i32*";  // 数组参数
+                    }
+                }
+            }
+            argTypes.push_back(paramType);
         }
 
         // 生成调用指令
         std::string funcName = "@" + node->ident;
 
-        if (funcEntry->getReturnType() == DataType::VOID)
+        if (returnType == DataType::VOID)
         {
             irStream << "  call void " << funcName << "(";
             for (size_t i = 0; i < argValues.size(); ++i)
             {
                 if (i > 0)
                     irStream << ", ";
-                irStream << "i32 " << argValues[i];
+                irStream << argTypes[i] << " " << argValues[i];
             }
             irStream << ")\n";
             currentValue = "";
@@ -836,7 +1228,7 @@ namespace sysy
             {
                 if (i > 0)
                     irStream << ", ";
-                irStream << "i32 " << argValues[i];
+                irStream << argTypes[i] << " " << argValues[i];
             }
             irStream << ")\n";
             currentValue = resultReg;
@@ -1013,6 +1405,191 @@ namespace sysy
         {
             node->addExp->accept(this);
         }
+}
+
+    // 常量表达式求值函数（用于全局变量初始值）
+    int CodeGenerator::evaluateConstExp(ConstExpNode* node) {
+        if (!node || !node->addExp) return 0;
+        return evaluateAddExp(node->addExp.get());
+    }
+    
+    int CodeGenerator::evaluateAddExp(AddExpNode* node) {
+        if (!node) return 0;
+        
+        if (!node->left) {
+            return evaluateMulExp(node->right.get());
+        }
+        
+        int leftVal = evaluateAddExp(node->left.get());
+        int rightVal = evaluateMulExp(node->right.get());
+        
+        if (node->op == BinaryOp::PLUS) {
+            return leftVal + rightVal;
+        } else {
+            return leftVal - rightVal;
+        }
+    }
+    
+    int CodeGenerator::evaluateMulExp(MulExpNode* node) {
+        if (!node) return 0;
+        
+        if (!node->left) {
+            return evaluateUnaryExp(node->right.get());
+        }
+        
+        int leftVal = evaluateMulExp(node->left.get());
+        int rightVal = evaluateUnaryExp(node->right.get());
+        
+        if (node->op == BinaryOp::MUL) {
+            return leftVal * rightVal;
+        } else if (node->op == BinaryOp::DIV) {
+            if (rightVal == 0) {
+                std::cerr << "Warning: Division by zero in constant expression" << std::endl;
+                return 0;
+            }
+            return leftVal / rightVal;
+        } else {
+            if (rightVal == 0) {
+                std::cerr << "Warning: Modulo by zero in constant expression" << std::endl;
+                return 0;
+            }
+            return leftVal % rightVal;
+        }
+    }
+    
+    int CodeGenerator::evaluateUnaryExp(UnaryExpNode* node) {
+        if (!node) return 0;
+        
+        if (node->operand) {
+            int val = evaluateUnaryExp(node->operand.get());
+            if (node->op == UnaryOp::PLUS) {
+                return val;
+            } else if (node->op == UnaryOp::MINUS) {
+                return -val;
+            } else {
+                return !val;
+            }
+        }
+        
+        if (node->primaryExp) {
+            return evaluatePrimaryExp(node->primaryExp.get());
+        }
+        
+        if (node->funcCall) {
+            std::cerr << "Warning: Function call in constant expression" << std::endl;
+            return 0;
+        }
+        
+        return 0;
+    }
+    
+    int CodeGenerator::evaluatePrimaryExp(PrimaryExpNode* node) {
+        if (!node) return 0;
+        
+        if (node->type == PrimaryExpType::NUMBER) {
+            return node->number ? node->number->value : 0;
+        } else if (node->type == PrimaryExpType::LVAL) {
+            return evaluateLVal(node->lVal.get());
+        } else if (node->type == PrimaryExpType::PAREN_EXP && node->exp) {
+            AddExpNode* addExp = dynamic_cast<AddExpNode*>(node->exp.get());
+            if (addExp) {
+                return evaluateAddExp(addExp);
+            }
+        }
+        
+        return 0;
+    }
+    
+    int CodeGenerator::evaluateLVal(LValNode* node) {
+        if (!node) return 0;
+        
+        // 查找常量变量
+        VariableEntry* var = symbolTableManager->lookupVariable(node->ident);
+        if (!var || !var->isConst) {
+            std::cerr << "Warning: Non-constant variable in constant expression: " << node->ident << std::endl;
+            return 0;
+        }
+        
+        if (!node->indices.empty()) {
+            std::cerr << "Warning: Array element access in constant expression not fully supported" << std::endl;
+            return 0;
+        }
+        
+        if (var->hasConstValue && !var->isArray) {
+            return var->constValue;
+        }
+        
+        return 0;
+    }
+
+    // 生成系统函数声明
+    void CodeGenerator::generateSystemFunctionDeclarations()
+    {
+        // 根据 sylib.h 中的定义生成系统函数声明
+        irStream << "; System function declarations\n";
+        irStream << "declare i32 @getint()\n";
+        irStream << "declare i32 @getch()\n";
+        irStream << "declare i32 @getarray(i32*)\n";
+        irStream << "declare void @putint(i32)\n";
+        irStream << "declare void @putch(i32)\n";
+        irStream << "declare void @putarray(i32, i32*)\n";
+        irStream << "\n";
+    }
+
+    // 检查是否为系统函数
+    bool CodeGenerator::isSystemFunction(const std::string &funcName)
+    {
+        return funcName == "getint" || funcName == "getch" || funcName == "getarray" ||
+               funcName == "putint" || funcName == "putch" || funcName == "putarray" ||
+               funcName == "getfloat" || funcName == "getfarray" ||
+               funcName == "putfloat" || funcName == "putfarray" || funcName == "putf" ||
+               funcName == "_sysy_starttime" || funcName == "_sysy_stoptime" ||
+               funcName == "before_main" || funcName == "after_main";
+    }
+
+    // 获取系统函数的返回类型
+    DataType CodeGenerator::getSystemFunctionReturnType(const std::string &funcName)
+    {
+        if (funcName == "getint" || funcName == "getch" || funcName == "getarray" ||
+            funcName == "getfloat" || funcName == "getfarray")
+        {
+            return DataType::INT; // 注意：getfloat 实际返回 float，但当前只支持 int
+        }
+        return DataType::VOID;
+    }
+
+    // 获取系统函数的参数数量
+    int CodeGenerator::getSystemFunctionParamCount(const std::string &funcName)
+    {
+        if (funcName == "getint" || funcName == "getch")
+        {
+            return 0;
+        }
+        else if (funcName == "putint" || funcName == "putch")
+        {
+            return 1;
+        }
+        else if (funcName == "getarray" || funcName == "putfloat")
+        {
+            return 1;
+        }
+        else if (funcName == "putarray" || funcName == "getfarray" || funcName == "putfarray")
+        {
+            return 2;
+        }
+        else if (funcName == "putf")
+        {
+            return -1; // 可变参数
+        }
+        else if (funcName == "_sysy_starttime" || funcName == "_sysy_stoptime")
+        {
+            return 1;
+        }
+        else if (funcName == "before_main" || funcName == "after_main")
+        {
+            return 0;
+        }
+        return 0;
     }
 
 } // namespace sysy
