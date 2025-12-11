@@ -178,7 +178,10 @@ namespace sysy
                 // 局部常量数组
                 std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
                 irStream << "  " << constName << " = alloca " << arrayType << "\n";
-                // 可以添加初始化逻辑
+                if (node->initVal)
+                {
+                    initializeConstLocalArray(constName, dimensions, node->initVal.get());
+                }
             }
             else
             {
@@ -446,12 +449,78 @@ namespace sysy
             }
             else
             {
-                int base = (linearIndex / stride) * stride;
+                int base = ((linearIndex + stride - 1) / stride) * stride;
                 linearIndex = base;
                 fillArrayFromInit(arrayName, dimensions, dimIndex + 1, child, linearIndex);
                 linearIndex = base + stride;
             }
         }
+    }
+
+    void CodeGenerator::fillConstArrayFromInit(const std::string &arrayName, const std::vector<int> &dimensions,
+                                               int dimIndex, ConstInitValNode *initVal, int &linearIndex)
+    {
+        if (!initVal)
+            return;
+
+        int total = getTotalElements(dimensions);
+        if (linearIndex >= total)
+            return;
+
+        if (initVal->isScalar)
+        {
+            if (!initVal->scalarVal)
+                return;
+            std::vector<int> indices = linearToIndices(linearIndex, dimensions);
+            std::string ptrReg = emitArrayElementPtr(arrayName, dimensions, indices);
+            initVal->scalarVal->accept(this);
+            irStream << "  store i32 " << currentValue << ", i32* " << ptrReg << "\n";
+            ++linearIndex;
+            return;
+        }
+
+        int stride = 1;
+        for (size_t i = dimIndex + 1; i < dimensions.size(); ++i)
+        {
+            stride *= dimensions[i];
+        }
+
+        for (auto &childPtr : initVal->arrayVals)
+        {
+            if (linearIndex >= total)
+                break;
+
+            ConstInitValNode *child = childPtr.get();
+            if (!child)
+                continue;
+
+            if (child->isScalar && child->scalarVal)
+            {
+                std::vector<int> indices = linearToIndices(linearIndex, dimensions);
+                std::string ptrReg = emitArrayElementPtr(arrayName, dimensions, indices);
+                child->scalarVal->accept(this);
+                irStream << "  store i32 " << currentValue << ", i32* " << ptrReg << "\n";
+                ++linearIndex;
+            }
+            else
+            {
+                int base = ((linearIndex + stride - 1) / stride) * stride;
+                linearIndex = base;
+                fillConstArrayFromInit(arrayName, dimensions, dimIndex + 1, child, linearIndex);
+                linearIndex = base + stride;
+            }
+        }
+    }
+
+    void CodeGenerator::initializeConstLocalArray(const std::string &arrayName, const std::vector<int> &dimensions, ConstInitValNode *initVal)
+    {
+        if (!initVal)
+            return;
+
+        zeroInitializeArray(arrayName, dimensions);
+
+        int linearIndex = 0;
+        fillConstArrayFromInit(arrayName, dimensions, 0, initVal, linearIndex);
     }
 
     void CodeGenerator::initializeLocalArray(const std::string &arrayName, const std::vector<int> &dimensions, InitValNode *initVal)
