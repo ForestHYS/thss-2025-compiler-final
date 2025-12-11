@@ -61,6 +61,8 @@ namespace sysy
                         int dimIndex, ConstInitValNode* initVal, int& linearIndex);
         void fillConstInitVector(const std::vector<int>& dimensions, int dimIndex,
                      ConstInitValNode* initVal, int& linearIndex, std::vector<int>& values);
+        void fillInitVector(const std::vector<int>& dimensions, int dimIndex,
+                    InitValNode* initVal, int& linearIndex, std::vector<int>& values);
         std::string buildArrayConstant(const std::vector<int>& dimensions, const std::vector<int>& values);
         std::string buildArrayConstantRecursive(const std::vector<int>& dimensions, const std::vector<int>& values,
                             int dimIndex, int& linearIndex);

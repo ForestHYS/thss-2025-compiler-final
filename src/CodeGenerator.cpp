@@ -162,9 +162,8 @@ namespace sysy
                 int initValue = 0;
                 if (node->initVal && node->initVal->isScalar && node->initVal->scalarVal)
                 {
-                    // 计算常量初始值
-                    node->initVal->scalarVal->accept(this);
-                    initValue = std::stoi(currentValue);
+                    // 计算常量初始值（纯常量表达式）
+                    initValue = evaluateConstExp(node->initVal->scalarVal.get());
                 }
                 irStream << constName << " = constant i32 " << initValue << "\n";
             }
@@ -240,7 +239,15 @@ namespace sysy
             {
                 // 全局数组
                 std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
-                irStream << varName << " = global " << arrayType << " zeroinitializer\n";
+                int total = getTotalElements(dimensions);
+                std::vector<int> values(total, 0);
+                int linearIndex = 0;
+                if (node->initVal)
+                {
+                    fillInitVector(dimensions, 0, node->initVal.get(), linearIndex, values);
+                }
+                std::string constAgg = buildArrayConstant(dimensions, values);
+                irStream << varName << " = global " << arrayType << " " << constAgg << "\n";
             }
             else
             {
@@ -571,6 +578,65 @@ namespace sysy
                 int base = ((linearIndex + stride - 1) / stride) * stride;
                 linearIndex = base;
                 fillConstInitVector(dimensions, dimIndex + 1, child, linearIndex, values);
+                linearIndex = base + stride;
+            }
+        }
+    }
+
+    void CodeGenerator::fillInitVector(const std::vector<int> &dimensions, int dimIndex,
+                                       InitValNode *initVal, int &linearIndex, std::vector<int> &values)
+    {
+        if (!initVal)
+            return;
+
+        int total = getTotalElements(dimensions);
+        if (linearIndex >= total)
+            return;
+
+        if (initVal->isScalar)
+        {
+            if (!initVal->scalarVal)
+                return;
+            AddExpNode *addExp = dynamic_cast<AddExpNode *>(initVal->scalarVal.get());
+            int val = 0;
+            if (addExp)
+            {
+                val = evaluateAddExp(addExp);
+            }
+            values[linearIndex++] = val;
+            return;
+        }
+
+        int stride = 1;
+        for (size_t i = dimIndex + 1; i < dimensions.size(); ++i)
+        {
+            stride *= dimensions[i];
+        }
+
+        for (auto &childPtr : initVal->arrayVals)
+        {
+            if (linearIndex >= total)
+                break;
+
+            InitValNode *child = childPtr.get();
+            if (!child)
+                continue;
+
+            if (child->isScalar && child->scalarVal)
+            {
+                AddExpNode *addExp = dynamic_cast<AddExpNode *>(child->scalarVal.get());
+                int val = 0;
+                if (addExp)
+                {
+                    val = evaluateAddExp(addExp);
+                }
+                values[linearIndex++] = val;
+            }
+            else
+            {
+                int base = ((linearIndex + stride - 1) / stride) * stride;
+                linearIndex = base;
+                fillInitVector(dimensions, dimIndex + 1, child, linearIndex, values);
                 linearIndex = base + stride;
             }
         }
