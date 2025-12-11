@@ -367,9 +367,10 @@ std::unique_ptr<UnaryExpNode> ASTBuilder::buildUnaryExp(SysYParser::UnaryExpCont
     // | IDENT L_PAREN (funcRParams)? R_PAREN
     // | unaryOp unaryExp;
     
+    auto node = std::make_unique<UnaryExpNode>();
+    
     if (ctx->unaryOp()) {
         // 一元运算符
-        auto node = std::make_unique<UnaryExpNode>();
         auto opText = ctx->unaryOp()->getText();
         if (opText == "+") {
             node->op = UnaryOp::PLUS;
@@ -379,26 +380,23 @@ std::unique_ptr<UnaryExpNode> ASTBuilder::buildUnaryExp(SysYParser::UnaryExpCont
             node->op = UnaryOp::NOT;
         }
         node->operand = buildUnaryExp(ctx->unaryExp());
-        return node;
+        node->primaryExp = nullptr;
+        node->funcCall = nullptr;
     } else if (ctx->IDENT()) {
         // 函数调用：IDENT L_PAREN (funcRParams)? R_PAREN
-        // 根据 AST 设计，函数调用是 FuncCallNode，但 MulExp 需要 UnaryExpNode
-        // 这里我们需要创建一个包装的 UnaryExp，但这样不符合 AST 设计
-        // 实际上，根据 AST 设计，函数调用应该作为 PrimaryExp 的一部分
-        // 为了简化，我们创建一个默认的 UnaryExp，operand 为 nullptr
-        // 函数调用信息将在后续阶段（语义分析）处理
-        auto node = std::make_unique<UnaryExpNode>();
-        node->op = UnaryOp::PLUS;  // 占位符
-        node->operand = nullptr;
-        return node;
-    } else {
-        // primaryExp - 创建一个包装的 UnaryExp
-        // 根据 AST 设计，PrimaryExp 应该直接使用，但为了类型一致性，我们包装它
-        auto node = std::make_unique<UnaryExpNode>();
         node->op = UnaryOp::PLUS;  // 占位符，表示无一元运算符
-        node->operand = nullptr;  // PrimaryExp 将在后续处理
-        return node;
+        node->operand = nullptr;
+        node->primaryExp = nullptr;
+        node->funcCall = buildFuncCall(ctx);
+    } else {
+        // primaryExp
+        node->op = UnaryOp::PLUS;  // 占位符，表示无一元运算符
+        node->operand = nullptr;
+        node->primaryExp = buildPrimaryExp(ctx->primaryExp());
+        node->funcCall = nullptr;
     }
+    
+    return node;
 }
 
 std::unique_ptr<PrimaryExpNode> ASTBuilder::buildPrimaryExp(SysYParser::PrimaryExpContext* ctx) {

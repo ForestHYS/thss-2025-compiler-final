@@ -2,6 +2,7 @@
 #include "Nodes.h"
 #include <sstream>
 #include <map>
+#include <iostream>
 
 namespace sysy
 {
@@ -109,26 +110,39 @@ namespace sysy
 
     void CodeGenerator::visitConstDef(ConstDefNode *node)
     {
-        // 查找符号表条目
-        SymbolEntry *entry = symbolTableManager->lookup(node->ident);
-        if (!entry)
-            return;
-
+        // 尝试从符号表获取类型信息（可选，用于获取维度信息）
+        SymbolEntry *entry = symbolTableManager->getCurrentScope()->lookup(node->ident);
+        if (!entry) {
+            entry = symbolTableManager->lookup(node->ident);
+        }
+        
         VariableEntry *constEntry = dynamic_cast<VariableEntry *>(entry);
-        if (!constEntry)
-            return;
-
-        // 判断是全局还是局部常量
-        if (constEntry->getScopeLevel() == 0)
+        
+        // 关键修复：基于当前代码生成上下文判断，而不是符号表中变量的 scopeLevel
+        int currentScopeLevel = symbolTableManager->getCurrentScope()->getScopeLevel();
+        bool isGlobal = (currentScopeLevel == 0);
+        
+        std::vector<int> dimensions;
+        bool isArray = !node->dims.empty();
+        
+        if (constEntry) {
+            // 从符号表获取维度信息
+            dimensions = constEntry->dimensions;
+            isArray = constEntry->isArray;
+        }
+        
+        if (isGlobal)
         {
             // 全局常量 - 生成为全局常量
             std::string constName = "@" + node->ident;
-            constEntry->irName = constName;
+            if (constEntry) {
+                constEntry->irName = constName;
+            }
 
-            if (constEntry->isArray)
+            if (isArray && !dimensions.empty())
             {
                 // 全局常量数组 - 生成为 constant
-                std::string arrayType = getLLVMArrayType(DataType::INT, constEntry->dimensions);
+                std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
                 // 简化处理：使用 zeroinitializer，实际应该根据 initVal 生成具体的初始值
                 irStream << constName << " = constant " << arrayType << " zeroinitializer\n";
             }
@@ -151,12 +165,14 @@ namespace sysy
             // 对于局部常量，可以选择生成 alloca 并标记为只读
             // 或者完全通过符号表内联（当前采用生成 alloca 的方式）
             std::string constName = "%" + node->ident;
-            constEntry->irName = constName;
+            if (constEntry) {
+                constEntry->irName = constName;
+            }
 
-            if (constEntry->isArray)
+            if (isArray && !dimensions.empty())
             {
                 // 局部常量数组
-                std::string arrayType = getLLVMArrayType(DataType::INT, constEntry->dimensions);
+                std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
                 irStream << "  " << constName << " = alloca " << arrayType << "\n";
                 // 可以添加初始化逻辑
             }
@@ -176,36 +192,62 @@ namespace sysy
 
     void CodeGenerator::visitVarDef(VarDefNode *node)
     {
-        // 查找符号表条目
-        SymbolEntry *entry = symbolTableManager->lookup(node->ident);
-        if (!entry)
-            return;
-
+        // 尝试从符号表获取类型信息（可选，用于获取维度信息）
+        SymbolEntry *entry = symbolTableManager->getCurrentScope()->lookup(node->ident);
+        if (!entry) {
+            entry = symbolTableManager->lookup(node->ident);
+        }
+        
         VariableEntry *varEntry = dynamic_cast<VariableEntry *>(entry);
-        if (!varEntry)
-            return;
-
-        // 判断是全局还是局部变量
-        if (varEntry->getScopeLevel() == 0)
+        
+        // 关键修复：基于当前代码生成上下文判断，而不是符号表中变量的 scopeLevel
+        // 如果当前作用域的 scopeLevel == 0，说明在全局作用域，生成 global
+        // 如果当前作用域的 scopeLevel > 0，说明在函数内部，生成 alloca
+        int currentScopeLevel = symbolTableManager->getCurrentScope()->getScopeLevel();
+        bool isGlobal = (currentScopeLevel == 0);
+        
+        std::vector<int> dimensions;
+        bool isArray = !node->dims.empty();
+        
+        if (varEntry) {
+            // 从符号表获取维度信息
+            dimensions = varEntry->dimensions;
+            isArray = varEntry->isArray;
+        }
+        
+        if (isGlobal)
         {
             // 全局变量
             std::string varName = "@" + node->ident;
-            varEntry->irName = varName;
+            if (varEntry) {
+                varEntry->irName = varName;
+            }
 
-            if (varEntry->isArray)
+            if (isArray && !dimensions.empty())
             {
                 // 全局数组
-                std::string arrayType = getLLVMArrayType(DataType::INT, varEntry->dimensions);
+                std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
                 irStream << varName << " = global " << arrayType << " zeroinitializer\n";
             }
             else
             {
                 // 全局标量
                 int initValue = 0;
-                if (node->initVal)
+                if (node->initVal && node->initVal->isScalar && node->initVal->scalarVal)
                 {
-                    // 如果有初始值，需要求值（简化处理，假设为0）
-                    // 实际应该执行常量求值
+                    // 全局变量的初始值必须是常量表达式
+                    // ExpNode 实际上就是 AddExpNode（因为 exp: addExp）
+                    AddExpNode* addExp = dynamic_cast<AddExpNode*>(node->initVal->scalarVal.get());
+                    if (addExp)
+                    {
+                        initValue = evaluateAddExp(addExp);
+                    }
+                    else
+                    {
+                        std::cerr << "Warning: Global variable '" << node->ident 
+                                  << "' has invalid initializer, using 0" << std::endl;
+                        initValue = 0;
+                    }
                 }
                 irStream << varName << " = global i32 " << initValue << "\n";
             }
@@ -214,13 +256,22 @@ namespace sysy
         {
             // 局部变量 - 生成 alloca 指令
             std::string varName = "%" + node->ident;
-            varEntry->irName = varName;
+            if (varEntry) {
+                varEntry->irName = varName;
+            }
 
-            if (varEntry->isArray)
+            if (isArray && !dimensions.empty())
             {
                 // 局部数组
-                std::string arrayType = getLLVMArrayType(DataType::INT, varEntry->dimensions);
+                std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
                 irStream << "  " << varName << " = alloca " << arrayType << "\n";
+                
+                // 修复：处理数组初始化
+                if (node->initVal)
+                {
+                    std::vector<int> indices;
+                    initializeArrayRecursive(varName, dimensions, node->initVal.get(), 0, indices);
+                }
             }
             else
             {
@@ -254,10 +305,126 @@ namespace sysy
         }
         else
         {
-            // 数组初始化 - 简化处理
+            // 数组初始化 - 这个函数现在主要用于表达式求值
+            // 实际的数组初始化在 visitVarDef 中通过 initializeArrayRecursive 处理
             for (auto &val : node->arrayVals)
             {
                 val->accept(this);
+            }
+        }
+    }
+    
+    // 数组初始化辅助函数：递归处理多维数组初始化
+    void CodeGenerator::initializeArrayRecursive(const std::string& arrayName, 
+                                                  const std::vector<int>& dimensions,
+                                                  InitValNode* initVal, 
+                                                  int currentDim,
+                                                  std::vector<int>& indices)
+    {
+        if (!initVal || currentDim >= static_cast<int>(dimensions.size())) return;
+        
+        if (initVal->isScalar)
+        {
+            // 标量值：扁平化初始化（如 {1, 2, 3, 4} 用于二维数组）
+            // 需要计算当前标量值应该存储到哪个位置
+            int flatIndex = 0;
+            int multiplier = 1;
+            for (int i = static_cast<int>(indices.size()); i < static_cast<int>(dimensions.size()); ++i)
+            {
+                multiplier *= dimensions[i];
+            }
+            for (size_t i = 0; i < indices.size(); ++i)
+            {
+                int localMultiplier = 1;
+                for (size_t j = i + 1; j < dimensions.size(); ++j)
+                {
+                    localMultiplier *= dimensions[j];
+                }
+                flatIndex += indices[i] * localMultiplier;
+            }
+            
+            // 补齐索引到完整维度
+            std::vector<int> fullIndices = indices;
+            while (static_cast<int>(fullIndices.size()) < static_cast<int>(dimensions.size()))
+            {
+                int remainingFlat = flatIndex;
+                for (size_t i = fullIndices.size() + 1; i < dimensions.size(); ++i)
+                {
+                    remainingFlat /= dimensions[i];
+                }
+                fullIndices.push_back(remainingFlat % dimensions[fullIndices.size()]);
+            }
+            
+            // 计算元素地址
+            std::string ptrReg = "%t" + std::to_string(tempCounter++);
+            irStream << "  " << ptrReg << " = getelementptr ";
+            irStream << getLLVMArrayType(DataType::INT, dimensions);
+            irStream << ", " << getLLVMArrayType(DataType::INT, dimensions) << "* ";
+            irStream << arrayName;
+            irStream << ", i32 0";
+            for (int idx : fullIndices)
+            {
+                irStream << ", i32 " << idx;
+            }
+            irStream << "\n";
+            
+            // 求值并存储
+            initVal->scalarVal->accept(this);
+            irStream << "  store i32 " << currentValue << ", i32* " << ptrReg << "\n";
+        }
+        else
+        {
+            // 数组值：递归处理
+            int dimSize = dimensions[currentDim];
+            int providedValues = static_cast<int>(initVal->arrayVals.size());
+            
+            for (int i = 0; i < dimSize && i < providedValues; ++i)
+            {
+                indices.push_back(i);
+                
+                if (currentDim + 1 < static_cast<int>(dimensions.size()))
+                {
+                    // 还有更多维度，继续递归
+                    if (initVal->arrayVals[i]->isScalar)
+                    {
+                        // 扁平化初始化：标量值直接存储
+                        initializeArrayRecursive(arrayName, dimensions, 
+                                                initVal->arrayVals[i].get(), 
+                                                currentDim + 1, indices);
+                    }
+                    else
+                    {
+                        // 嵌套数组初始化
+                        initializeArrayRecursive(arrayName, dimensions, 
+                                                initVal->arrayVals[i].get(), 
+                                                currentDim + 1, indices);
+                    }
+                }
+                else
+                {
+                    // 最后一维，处理标量值
+                    if (initVal->arrayVals[i]->isScalar && initVal->arrayVals[i]->scalarVal)
+                    {
+                        // 计算元素地址
+                        std::string ptrReg = "%t" + std::to_string(tempCounter++);
+                        irStream << "  " << ptrReg << " = getelementptr ";
+                        irStream << getLLVMArrayType(DataType::INT, dimensions);
+                        irStream << ", " << getLLVMArrayType(DataType::INT, dimensions) << "* ";
+                        irStream << arrayName;
+                        irStream << ", i32 0";
+                        for (int idx : indices)
+                        {
+                            irStream << ", i32 " << idx;
+                        }
+                        irStream << "\n";
+                        
+                        // 求值并存储
+                        initVal->arrayVals[i]->scalarVal->accept(this);
+                        irStream << "  store i32 " << currentValue << ", i32* " << ptrReg << "\n";
+                    }
+                }
+                
+                indices.pop_back();
             }
         }
     }
@@ -266,8 +433,13 @@ namespace sysy
     {
         // 查找函数符号表条目
         FunctionEntry *funcEntry = symbolTableManager->lookupFunction(node->ident);
-        if (!funcEntry)
+        if (!funcEntry) {
+            std::cerr << "Error: Function '" << node->ident << "' not found in symbol table" << std::endl;
             return;
+        }
+
+        // 关键修复：进入函数作用域，这样函数内部的变量会生成 alloca 而不是 global
+        symbolTableManager->enterFunction(funcEntry);
 
         // 生成函数签名
         std::string funcName = "@" + node->ident;
@@ -334,18 +506,25 @@ namespace sysy
         }
 
         irStream << "}\n";
+        
+        // 关键修复：退出函数作用域
+        symbolTableManager->exitFunction();
     }
 
     void CodeGenerator::visitFuncFParam(FuncFParamNode *node)
     {
         // 查找符号表条目
         SymbolEntry *paramEntry = symbolTableManager->lookup(node->ident);
-        if (!paramEntry)
+        if (!paramEntry) {
+            std::cerr << "Error: Parameter '" << node->ident << "' not found in symbol table" << std::endl;
             return;
+        }
 
         VariableEntry *varEntry = dynamic_cast<VariableEntry *>(paramEntry);
-        if (!varEntry)
+        if (!varEntry) {
+            std::cerr << "Error: '" << node->ident << "' is not a variable" << std::endl;
             return;
+        }
 
         // 生成参数的局部变量名
         std::string paramName = "%" + node->ident;
@@ -396,12 +575,22 @@ namespace sysy
 
             // 获取左值地址
             SymbolEntry *entry = symbolTableManager->lookup(node->lVal->ident);
-            if (!entry)
+            if (!entry) {
+                std::cerr << "Error: Variable '" << node->lVal->ident << "' not found in symbol table" << std::endl;
                 return;
+            }
 
             VariableEntry *varEntry = dynamic_cast<VariableEntry *>(entry);
-            if (!varEntry)
+            if (!varEntry) {
+                std::cerr << "Error: '" << node->lVal->ident << "' is not a variable" << std::endl;
                 return;
+            }
+            
+            // 检查变量是否已经生成了IR名称（即是否已经定义了）
+            if (varEntry->irName.empty()) {
+                std::cerr << "Error: Variable '" << node->lVal->ident << "' has not been defined (no IR name)" << std::endl;
+                return;
+            }
 
             if (node->lVal->indices.empty())
             {
@@ -594,6 +783,12 @@ namespace sysy
         if (node->exp)
         {
             node->exp->accept(this);
+            // 确保 currentValue 不为空
+            if (currentValue.empty()) {
+                // 如果表达式访问没有设置 currentValue，使用默认值 0
+                // 这通常不应该发生，但作为安全措施
+                currentValue = "0";
+            }
             irStream << "  ret i32 " << currentValue << "\n";
         }
         else
@@ -699,6 +894,16 @@ namespace sysy
                 currentValue = extReg;
             }
         }
+        else if (node->primaryExp)
+        {
+            // 没有一元运算符，直接访问 PrimaryExp
+            node->primaryExp->accept(this);
+        }
+        else if (node->funcCall)
+        {
+            // 函数调用
+            node->funcCall->accept(this);
+        }
     }
 
     void CodeGenerator::visitPrimaryExp(PrimaryExpNode *node)
@@ -721,12 +926,28 @@ namespace sysy
     {
         // 查找符号表条目
         SymbolEntry *entry = symbolTableManager->lookup(node->ident);
-        if (!entry)
+        if (!entry) {
+            std::cerr << "Error: Variable '" << node->ident << "' not found in symbol table" << std::endl;
+            // 设置一个默认值，避免后续代码崩溃
+            currentValue = "0";
             return;
+        }
 
         VariableEntry *varEntry = dynamic_cast<VariableEntry *>(entry);
-        if (!varEntry)
+        if (!varEntry) {
+            std::cerr << "Error: '" << node->ident << "' is not a variable" << std::endl;
+            // 设置一个默认值，避免后续代码崩溃
+            currentValue = "0";
             return;
+        }
+        
+        // 检查变量是否已经生成了IR名称（即是否已经定义了）
+        if (varEntry->irName.empty()) {
+            std::cerr << "Error: Variable '" << node->ident << "' has not been defined (no IR name)" << std::endl;
+            // 设置一个默认值，避免后续代码崩溃
+            currentValue = "0";
+            return;
+        }
 
         if (node->indices.empty())
         {
@@ -802,8 +1023,12 @@ namespace sysy
     {
         // 查找函数
         FunctionEntry *funcEntry = symbolTableManager->lookupFunction(node->ident);
-        if (!funcEntry)
+        if (!funcEntry) {
+            std::cerr << "Error: Function '" << node->ident << "' not found in symbol table" << std::endl;
+            // 设置一个默认返回值，避免后续代码崩溃
+            currentValue = "0";
             return;
+        }
 
         // 计算所有参数
         std::vector<std::string> argValues;
@@ -1013,6 +1238,121 @@ namespace sysy
         {
             node->addExp->accept(this);
         }
+}
+
+    // 常量表达式求值函数（用于全局变量初始值）
+    int CodeGenerator::evaluateConstExp(ConstExpNode* node) {
+        if (!node || !node->addExp) return 0;
+        return evaluateAddExp(node->addExp.get());
     }
+    
+    int CodeGenerator::evaluateAddExp(AddExpNode* node) {
+        if (!node) return 0;
+        
+        if (!node->left) {
+            return evaluateMulExp(node->right.get());
+        }
+        
+        int leftVal = evaluateAddExp(node->left.get());
+        int rightVal = evaluateMulExp(node->right.get());
+        
+        if (node->op == BinaryOp::PLUS) {
+            return leftVal + rightVal;
+        } else {
+            return leftVal - rightVal;
+        }
+    }
+    
+    int CodeGenerator::evaluateMulExp(MulExpNode* node) {
+        if (!node) return 0;
+        
+        if (!node->left) {
+            return evaluateUnaryExp(node->right.get());
+        }
+        
+        int leftVal = evaluateMulExp(node->left.get());
+        int rightVal = evaluateUnaryExp(node->right.get());
+        
+        if (node->op == BinaryOp::MUL) {
+            return leftVal * rightVal;
+        } else if (node->op == BinaryOp::DIV) {
+            if (rightVal == 0) {
+                std::cerr << "Warning: Division by zero in constant expression" << std::endl;
+                return 0;
+            }
+            return leftVal / rightVal;
+        } else {
+            if (rightVal == 0) {
+                std::cerr << "Warning: Modulo by zero in constant expression" << std::endl;
+                return 0;
+            }
+            return leftVal % rightVal;
+        }
+    }
+    
+    int CodeGenerator::evaluateUnaryExp(UnaryExpNode* node) {
+        if (!node) return 0;
+        
+        if (node->operand) {
+            int val = evaluateUnaryExp(node->operand.get());
+            if (node->op == UnaryOp::PLUS) {
+                return val;
+            } else if (node->op == UnaryOp::MINUS) {
+                return -val;
+            } else {
+                return !val;
+            }
+        }
+        
+        if (node->primaryExp) {
+            return evaluatePrimaryExp(node->primaryExp.get());
+        }
+        
+        if (node->funcCall) {
+            std::cerr << "Warning: Function call in constant expression" << std::endl;
+            return 0;
+        }
+        
+        return 0;
+    }
+    
+    int CodeGenerator::evaluatePrimaryExp(PrimaryExpNode* node) {
+        if (!node) return 0;
+        
+        if (node->type == PrimaryExpType::NUMBER) {
+            return node->number ? node->number->value : 0;
+        } else if (node->type == PrimaryExpType::LVAL) {
+            return evaluateLVal(node->lVal.get());
+        } else if (node->type == PrimaryExpType::PAREN_EXP && node->exp) {
+            AddExpNode* addExp = dynamic_cast<AddExpNode*>(node->exp.get());
+            if (addExp) {
+                return evaluateAddExp(addExp);
+            }
+        }
+        
+        return 0;
+    }
+    
+    int CodeGenerator::evaluateLVal(LValNode* node) {
+        if (!node) return 0;
+        
+        // 查找常量变量
+        VariableEntry* var = symbolTableManager->lookupVariable(node->ident);
+        if (!var || !var->isConst) {
+            std::cerr << "Warning: Non-constant variable in constant expression: " << node->ident << std::endl;
+            return 0;
+        }
+        
+        if (!node->indices.empty()) {
+            std::cerr << "Warning: Array element access in constant expression not fully supported" << std::endl;
+            return 0;
+        }
+        
+        if (var->hasConstValue && !var->isArray) {
+            return var->constValue;
+        }
+        
+        return 0;
+}
 
 } // namespace sysy

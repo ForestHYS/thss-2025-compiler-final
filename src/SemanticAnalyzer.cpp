@@ -99,6 +99,7 @@ int SemanticAnalyzer::evaluateMulExp(MulExpNode* node) {
 
 int SemanticAnalyzer::evaluateUnaryExp(UnaryExpNode* node) {
     if (node->operand) {
+        // 处理一元运算符的情况
         int val = evaluateUnaryExp(node->operand.get());
         
         if (node->op == UnaryOp::PLUS) {
@@ -110,7 +111,18 @@ int SemanticAnalyzer::evaluateUnaryExp(UnaryExpNode* node) {
         }
     }
     
-    // TODO: 处理 PrimaryExp 的情况
+    // 修复：处理 primaryExp 的情况
+    if (node->primaryExp) {
+        return evaluatePrimaryExp(node->primaryExp.get());
+    }
+    
+    // 函数调用不应该出现在常量表达式中
+    if (node->funcCall) {
+        reportError("Function call in constant expression: " + node->funcCall->ident);
+        return 0;
+    }
+    
+    // 如果都没有，说明 AST 构建有问题
     reportError("Invalid unary expression in constant context");
     return 0;
 }
@@ -120,9 +132,19 @@ int SemanticAnalyzer::evaluatePrimaryExp(PrimaryExpNode* node) {
         return node->number->value;
     } else if (node->type == PrimaryExpType::LVAL) {
         return evaluateLVal(node->lVal.get());
+    } else if (node->type == PrimaryExpType::PAREN_EXP && node->exp) {
+        // 修复：处理括号表达式，递归求值
+        // 括号表达式中的 exp 是 ExpNode，需要转换为 AddExpNode
+        // 在常量表达式上下文中，exp 应该是 AddExpNode
+        AddExpNode* addExp = dynamic_cast<AddExpNode*>(node->exp.get());
+        if (addExp) {
+            return evaluateAddExp(addExp);
+        } else {
+            reportError("Invalid expression type in constant context");
+            return 0;
+        }
     } else {
-        // TODO: 处理括号表达式
-        reportError("Cannot evaluate parenthesized expression in constant context");
+        reportError("Cannot evaluate primary expression in constant context");
         return 0;
     }
 }
@@ -139,8 +161,25 @@ int SemanticAnalyzer::evaluateLVal(LValNode* node) {
         return 0;
     }
     
-    // TODO: 需要在 VariableEntry 中存储常量值
-    reportError("Constant value evaluation not fully implemented");
+    // 修复：处理数组元素访问（需要索引）
+    if (!node->indices.empty()) {
+        // 数组元素访问：需要计算索引并返回对应元素的值
+        // 这里简化处理，暂时不支持数组元素的常量求值
+        reportError("Array element access in constant expression not fully implemented: " + node->ident);
+        return 0;
+    }
+    
+    // 修复：返回标量常量的值
+    if (var->hasConstValue && !var->isArray) {
+        return var->constValue;
+    }
+    
+    // 如果常量值未计算，说明是数组常量或初始化有问题
+    if (var->isArray) {
+        reportError("Cannot use array constant without subscript: " + node->ident);
+    } else {
+        reportError("Constant value not available for: " + node->ident);
+    }
     return 0;
 }
 
@@ -200,6 +239,12 @@ void SemanticAnalyzer::visitConstDef(ConstDefNode* node) {
     if (node->initVal) {
         node->initVal->accept(this);
         entry->isInitialized = true;
+        
+        // 修复：计算并存储标量常量的值
+        if (!entry->isArray && node->initVal->isScalar && node->initVal->scalarVal) {
+            entry->constValue = evaluateConstExp(node->initVal->scalarVal.get());
+            entry->hasConstValue = true;
+        }
     } else {
         reportError("Constant must be initialized: " + node->ident);
     }

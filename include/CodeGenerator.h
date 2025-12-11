@@ -32,6 +32,20 @@ namespace sysy
         std::string getLLVMArrayType(DataType elementType, const std::vector<int> &dimensions);
         std::string generateLabel(const std::string &prefix);
         std::string generateVarName(const std::string &name);
+        
+        // 常量表达式求值（用于全局变量初始值）
+        int evaluateConstExp(ConstExpNode* node);
+        int evaluateAddExp(AddExpNode* node);
+        int evaluateMulExp(MulExpNode* node);
+        int evaluateUnaryExp(UnaryExpNode* node);
+        int evaluatePrimaryExp(PrimaryExpNode* node);
+        int evaluateLVal(LValNode* node);
+        
+        // 数组初始化辅助函数
+        void initializeArray(const std::string& arrayName, const std::vector<int>& dimensions, 
+                            InitValNode* initVal, int currentDim, int flatIndex);
+        void initializeArrayRecursive(const std::string& arrayName, const std::vector<int>& dimensions,
+                                     InitValNode* initVal, int currentDim, std::vector<int>& indices);
 
     public:
         CodeGenerator(SymbolTableManager *symTabMgr);

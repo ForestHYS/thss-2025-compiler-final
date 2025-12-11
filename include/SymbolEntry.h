@@ -59,11 +59,13 @@ public:
     std::vector<ConstExpNode*> dimExprs;  // 数组维度表达式列表
     bool isInitialized;
     std::string irName;  // 对应的LLVM IR变量名（如 "%a"）
+    int constValue;  // 常量值（仅用于标量常量）
+    bool hasConstValue;  // 是否已计算常量值
     
     VariableEntry(const std::string& name, DataType dataType, bool isConst, int scopeLevel)
         : SymbolEntry(name, isConst ? SymbolType::CONSTANT : SymbolType::VARIABLE, 
                      dataType, isConst, scopeLevel),
-          isArray(false), isInitialized(false), irName("") {}
+          isArray(false), isInitialized(false), irName(""), constValue(0), hasConstValue(false) {}
     
     bool isArrayType() const { return isArray; }
     int getArraySize() const;
