@@ -17,7 +17,7 @@ namespace sysy
     static std::string condResultReg;
 
     CodeGenerator::CodeGenerator(SymbolTableManager *symTabMgr)
-        : symbolTableManager(symTabMgr), labelCounter(0), currentParamIndex(0), currentBlockLabel(""), inFunctionFirstBlock(false)
+        : symbolTableManager(symTabMgr), labelCounter(0), currentParamIndex(0), currentBlockLabel(""), inFunctionFirstBlock(false), collectingAllocas(false), currentAllocaIndex(0)
     {
     }
 
@@ -170,35 +170,20 @@ namespace sysy
         }
         else
         {
-            // 局部常量
-            // 对于局部常量，可以选择生成 alloca 并标记为只读
-            // 或者完全通过符号表内联（当前采用生成 alloca 的方式）
-            std::string constName = "%" + node->ident;
+            // 局部常量 - alloca已在函数入口块生成（alloca hoisting）
+            // 这里只处理初始化
             
-            // 使用函数级别的计数器生成唯一名称
+            // 从pendingAllocas获取已分配的IR名称
+            std::string constName = getNextAllocaIrName(node->ident);
+            
+            // 更新符号表条目的irName
             if (constEntry) {
-                static std::map<SymbolTable*, std::map<std::string, int>> funcConstCounters;
-                SymbolTable* funcScope = symbolTableManager->functionTable;
-                
-                auto& constCounter = funcConstCounters[funcScope];
-                
-                if (constCounter.find(node->ident) != constCounter.end()) {
-                    int count = constCounter[node->ident];
-                    constCounter[node->ident]++;
-                    constName = "%" + node->ident + std::to_string(count);
-                } else {
-                    constCounter[node->ident] = 1;
-                    constName = "%" + node->ident;
-                }
-                
                 constEntry->irName = constName;
             }
 
             if (isArray && !dimensions.empty())
             {
-                // 局部常量数组
-                std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
-                irStream << "  " << constName << " = alloca " << arrayType << "\n";
+                // 局部常量数组 - 处理初始化
                 if (node->initVal)
                 {
                     initializeConstLocalArray(constName, dimensions, node->initVal.get());
@@ -206,9 +191,7 @@ namespace sysy
             }
             else
             {
-                // 局部常量标量 - 生成 alloca 并初始化
-                irStream << "  " << constName << " = alloca i32\n";
-
+                // 局部常量标量 - 如果有初始值，生成 store 指令
                 if (node->initVal && node->initVal->isScalar && node->initVal->scalarVal)
                 {
                     node->initVal->scalarVal->accept(this);
@@ -255,15 +238,21 @@ namespace sysy
             {
                 // 全局数组
                 std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
-                int total = getTotalElements(dimensions);
-                std::vector<int> values(total, 0);
-                int linearIndex = 0;
                 if (node->initVal)
                 {
+                    // 有初始化器时，生成完整常量聚合
+                    int total = getTotalElements(dimensions);
+                    std::vector<int> values(total, 0);
+                    int linearIndex = 0;
                     fillInitVector(dimensions, 0, node->initVal.get(), linearIndex, values);
+                    std::string constAgg = buildArrayConstant(dimensions, values);
+                    irStream << varName << " = global " << arrayType << " " << constAgg << "\n";
                 }
-                std::string constAgg = buildArrayConstant(dimensions, values);
-                irStream << varName << " = global " << arrayType << " " << constAgg << "\n";
+                else
+                {
+                    // 无初始化器时，使用 zeroinitializer
+                    irStream << varName << " = global " << arrayType << " zeroinitializer\n";
+                }
             }
             else
             {
@@ -290,41 +279,20 @@ namespace sysy
         }
         else
         {
-            // 局部变量 - 生成 alloca 指令
-            // 根本性修复：使用唯一的IR名称，避免不同作用域的变量重名
-            // 在LLVM IR中，每个局部变量必须有唯一的名称
-            std::string varName = "%" + node->ident;
+            // 局部变量 - alloca已在函数入口块生成（alloca hoisting）
+            // 这里只处理初始化
             
-            // 为了避免重名（例如不同作用域中的同名变量），使用函数级别的计数器
-            // 使用函数符号表指针作为函数的唯一标识
+            // 从pendingAllocas获取已分配的IR名称
+            std::string varName = getNextAllocaIrName(node->ident);
+            
+            // 更新符号表条目的irName
             if (varEntry) {
-                // 使用静态map记录每个变量名在当前函数中出现的次数
-                static std::map<SymbolTable*, std::map<std::string, int>> funcVarCounters;
-                SymbolTable* funcScope = symbolTableManager->functionTable;
-                
-                auto& varCounter = funcVarCounters[funcScope];
-                
-                if (varCounter.find(node->ident) != varCounter.end()) {
-                    // 已经存在同名变量，使用计数器生成唯一名称
-                    int count = varCounter[node->ident];
-                    varCounter[node->ident]++;
-                    varName = "%" + node->ident + std::to_string(count);
-                } else {
-                    // 第一次出现，记录但不添加后缀
-                    varCounter[node->ident] = 1;
-                    varName = "%" + node->ident;
-                }
-                
                 varEntry->irName = varName;
             }
 
             if (isArray && !dimensions.empty())
             {
-                // 局部数组
-                std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
-                irStream << "  " << varName << " = alloca " << arrayType << "\n";
-                
-                // 修复：处理数组初始化
+                // 局部数组 - 处理初始化
                 if (node->initVal)
                 {
                     initializeLocalArray(varName, dimensions, node->initVal.get());
@@ -332,10 +300,7 @@ namespace sysy
             }
             else
             {
-                // 局部标量
-                irStream << "  " << varName << " = alloca i32\n";
-
-                // 如果有初始值，生成 store 指令
+                // 局部标量 - 如果有初始值，生成 store 指令
                 if (node->initVal)
                 {
                     node->initVal->accept(this);
@@ -420,11 +385,25 @@ namespace sysy
     void CodeGenerator::zeroInitializeArray(const std::string &arrayName, const std::vector<int> &dimensions)
     {
         int total = getTotalElements(dimensions);
-        for (int i = 0; i < total; ++i)
+        // 对于大数组，使用 memset 优化；对于小数组，逐个 store
+        const int MEMSET_THRESHOLD = 64;
+        if (total > MEMSET_THRESHOLD)
         {
-            std::vector<int> indices = linearToIndices(i, dimensions);
-            std::string ptrReg = emitArrayElementPtr(arrayName, dimensions, indices);
-            irStream << "  store i32 0, i32* " << ptrReg << "\n";
+            // 使用 llvm.memset 进行零初始化
+            std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
+            std::string ptrReg = "%memset_ptr" + std::to_string(tempCounter++);
+            irStream << "  " << ptrReg << " = bitcast " << arrayType << "* " << arrayName << " to i8*\n";
+            int byteSize = total * 4; // i32 = 4 bytes
+            irStream << "  call void @llvm.memset.p0i8.i64(i8* " << ptrReg << ", i8 0, i64 " << byteSize << ", i1 false)\n";
+        }
+        else
+        {
+            for (int i = 0; i < total; ++i)
+            {
+                std::vector<int> indices = linearToIndices(i, dimensions);
+                std::string ptrReg = emitArrayElementPtr(arrayName, dimensions, indices);
+                irStream << "  store i32 0, i32* " << ptrReg << "\n";
+            }
         }
     }
 
@@ -754,6 +733,33 @@ namespace sysy
         {
             currentParamIndex = i;
             node->params[i]->accept(this);
+        }
+        
+        // ========== Alloca Hoisting: 先收集所有局部变量，在入口块生成alloca ==========
+        if (node->block)
+        {
+            collectLocalVars(node->block.get());
+            
+            // 在入口块生成所有alloca指令
+            for (auto& info : pendingAllocas)
+            {
+                if (info.entry) {
+                    info.entry->irName = info.irName;
+                }
+                
+                if (info.isArray && !info.dimensions.empty())
+                {
+                    std::string arrayType = getLLVMArrayType(DataType::INT, info.dimensions);
+                    irStream << "  " << info.irName << " = alloca " << arrayType << "\n";
+                }
+                else
+                {
+                    irStream << "  " << info.irName << " = alloca i32\n";
+                }
+            }
+            
+            // 重置alloca索引，用于visitVarDef/visitConstDef匹配
+            currentAllocaIndex = 0;
         }
 
         // 生成函数体
@@ -1873,6 +1879,8 @@ namespace sysy
         irStream << "declare void @putint(i32)\n";
         irStream << "declare void @putch(i32)\n";
         irStream << "declare void @putarray(i32, i32*)\n";
+        // llvm.memset 内置函数声明，用于大数组零初始化
+        irStream << "declare void @llvm.memset.p0i8.i64(i8* nocapture writeonly, i8, i64, i1 immarg)\n";
         irStream << "\n";
     }
 
@@ -1977,6 +1985,154 @@ namespace sysy
         }
         
         return paramTypes;
+    }
+
+    // ========== Alloca Hoisting: 收集局部变量 ==========
+    
+    std::string CodeGenerator::getNextAllocaIrName(const std::string& varName)
+    {
+        // 从pendingAllocas中按顺序获取对应的irName
+        if (currentAllocaIndex < pendingAllocas.size())
+        {
+            // 验证变量名匹配
+            if (pendingAllocas[currentAllocaIndex].name == varName)
+            {
+                return pendingAllocas[currentAllocaIndex++].irName;
+            }
+            // 如果不匹配，可能是跳过了某些声明，搜索匹配的
+            for (size_t i = currentAllocaIndex; i < pendingAllocas.size(); ++i)
+            {
+                if (pendingAllocas[i].name == varName)
+                {
+                    currentAllocaIndex = i + 1;
+                    return pendingAllocas[i].irName;
+                }
+            }
+        }
+        // 找不到时返回默认名称（不应该发生）
+        std::cerr << "Warning: Could not find alloca for variable '" << varName << "'" << std::endl;
+        return "%" + varName;
+    }
+    
+    void CodeGenerator::collectLocalVars(BlockStmtNode* block)
+    {
+        pendingAllocas.clear();
+        allocaNameCounters.clear();
+        collectingAllocas = true;
+        collectLocalVarsFromBlock(block);
+        collectingAllocas = false;
+    }
+    
+    void CodeGenerator::collectLocalVarsFromBlock(BlockStmtNode* block)
+    {
+        if (!block) return;
+        
+        for (auto& item : block->blockItems)
+        {
+            if (!item) continue;
+            
+            // 处理声明
+            if (item->isDecl && item->decl)
+            {
+                // 变量声明
+                VarDeclNode* varDecl = dynamic_cast<VarDeclNode*>(item->decl.get());
+                if (varDecl)
+                {
+                    for (auto& def : varDecl->varDefs)
+                    {
+                        if (!def) continue;
+                        
+                        LocalVarInfo info;
+                        info.name = def->ident;
+                        info.entry = nullptr; // 不在这里设置entry
+                        info.isArray = !def->dims.empty();
+                        
+                        // 从AST获取维度
+                        for (auto& dim : def->dims) {
+                            if (dim) {
+                                info.dimensions.push_back(evaluateConstExp(dim.get()));
+                            }
+                        }
+                        
+                        // 生成唯一的IR名称
+                        if (allocaNameCounters.find(info.name) != allocaNameCounters.end()) {
+                            int count = allocaNameCounters[info.name]++;
+                            info.irName = "%" + info.name + std::to_string(count);
+                        } else {
+                            allocaNameCounters[info.name] = 1;
+                            info.irName = "%" + info.name;
+                        }
+                        
+                        pendingAllocas.push_back(info);
+                    }
+                }
+                
+                // 常量声明
+                ConstDeclNode* constDecl = dynamic_cast<ConstDeclNode*>(item->decl.get());
+                if (constDecl)
+                {
+                    for (auto& def : constDecl->constDefs)
+                    {
+                        if (!def) continue;
+                        
+                        LocalVarInfo info;
+                        info.name = def->ident;
+                        info.entry = nullptr; // 不在这里设置entry
+                        info.isArray = !def->dims.empty();
+                        
+                        // 从AST获取维度
+                        for (auto& dim : def->dims) {
+                            if (dim) {
+                                info.dimensions.push_back(evaluateConstExp(dim.get()));
+                            }
+                        }
+                        
+                        if (allocaNameCounters.find(info.name) != allocaNameCounters.end()) {
+                            int count = allocaNameCounters[info.name]++;
+                            info.irName = "%" + info.name + std::to_string(count);
+                        } else {
+                            allocaNameCounters[info.name] = 1;
+                            info.irName = "%" + info.name;
+                        }
+                        
+                        pendingAllocas.push_back(info);
+                    }
+                }
+            }
+            
+            // 递归处理语句中的嵌套块
+            if (item->stmt)
+            {
+                collectLocalVarsFromStmt(item->stmt.get());
+            }
+        }
+    }
+    
+    void CodeGenerator::collectLocalVarsFromStmt(StmtNode* stmt)
+    {
+        if (!stmt) return;
+        
+        // Block语句
+        BlockStmtNode* block = dynamic_cast<BlockStmtNode*>(stmt);
+        if (block) {
+            collectLocalVarsFromBlock(block);
+            return;
+        }
+        
+        // If语句
+        IfStmtNode* ifStmt = dynamic_cast<IfStmtNode*>(stmt);
+        if (ifStmt) {
+            if (ifStmt->thenStmt) collectLocalVarsFromStmt(ifStmt->thenStmt.get());
+            if (ifStmt->elseStmt) collectLocalVarsFromStmt(ifStmt->elseStmt.get());
+            return;
+        }
+        
+        // While语句
+        WhileStmtNode* whileStmt = dynamic_cast<WhileStmtNode*>(stmt);
+        if (whileStmt) {
+            if (whileStmt->body) collectLocalVarsFromStmt(whileStmt->body.get());
+            return;
+        }
     }
 
 } // namespace sysy

@@ -6,6 +6,8 @@
 #include <memory>
 #include <string>
 #include <sstream>
+#include <map>
+#include <vector>
 
 namespace sysy
 {
@@ -31,6 +33,27 @@ namespace sysy
         
         // 标记是否在处理函数体的首块（首块不创建新作用域）
         bool inFunctionFirstBlock;
+        
+        // Alloca hoisting: 收集函数内所有局部变量信息
+        struct LocalVarInfo {
+            std::string name;           // 变量名
+            std::string irName;         // 生成的IR名称
+            bool isArray;               // 是否为数组
+            std::vector<int> dimensions; // 数组维度
+            VariableEntry* entry;       // 符号表条目
+        };
+        std::vector<LocalVarInfo> pendingAllocas; // 待生成的alloca
+        bool collectingAllocas;         // 是否处于收集阶段
+        std::map<std::string, int> allocaNameCounters; // 用于生成唯一名称
+        size_t currentAllocaIndex;      // 当前处理的alloca索引
+        
+        // 收集函数体中所有局部变量声明
+        void collectLocalVars(BlockStmtNode* block);
+        void collectLocalVarsFromBlock(BlockStmtNode* block);
+        void collectLocalVarsFromStmt(StmtNode* stmt);
+        
+        // 获取下一个待分配变量的IR名称
+        std::string getNextAllocaIrName(const std::string& varName);
 
         // 辅助方法
         std::string getLLVMType(DataType dataType);
