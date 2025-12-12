@@ -24,6 +24,9 @@ private:
     // 错误标志
     bool hasError;
     
+    // 标记是否在处理函数体的首块（首块不创建新作用域）
+    bool inFunctionFirstBlock;
+    
     //类型检查
     void checkType(ExpNode* exp, DataType expectedType);
     

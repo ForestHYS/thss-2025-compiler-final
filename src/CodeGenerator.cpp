@@ -3,6 +3,7 @@
 #include <sstream>
 #include <map>
 #include <iostream>
+#include <algorithm>
 
 namespace sysy
 {
@@ -16,7 +17,7 @@ namespace sysy
     static std::string condResultReg;
 
     CodeGenerator::CodeGenerator(SymbolTableManager *symTabMgr)
-        : symbolTableManager(symTabMgr), labelCounter(0), currentParamIndex(0)
+        : symbolTableManager(symTabMgr), labelCounter(0), currentParamIndex(0), currentBlockLabel(""), inFunctionFirstBlock(false), collectingAllocas(false), currentAllocaIndex(0)
     {
     }
 
@@ -74,7 +75,64 @@ namespace sysy
     std::string CodeGenerator::generateVarName(const std::string &name)
     {
         // 处理变量名，确保符合LLVM IR命名规范
-        return "%" + name;
+        return mangleName(name, /*isGlobal*/false, /*dupSuffix*/0);
+    }
+
+    // 将标识符规范化为安全且长度受限的LLVM名称
+    // 规则：
+    // - 仅保留 [A-Za-z0-9_.$]，其余替换为 '_'
+    // - 可选附加去重后缀（如 1,2,3...）
+    // - 总长度限制为 MAX_LEN，超长则截断并追加 8位十六进制哈希，确保区分
+    std::string CodeGenerator::mangleName(const std::string& name, bool isGlobal, int dupSuffix)
+    {
+        // 1) 合法字符过滤
+        std::string filtered;
+        filtered.reserve(name.size());
+        for (char c : name) {
+            if ((c >= 'A' && c <= 'Z') ||
+                (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') ||
+                c == '_' || c == '.' || c == '$') {
+                filtered.push_back(c);
+            } else {
+                filtered.push_back('_');
+            }
+        }
+
+        // 2) 附加去重后缀（首个不加，后续加 1,2,...）
+        std::string base = filtered;
+        if (dupSuffix > 0) {
+            base += std::to_string(dupSuffix);
+        }
+
+        // 3) 超长截断 + 短哈希（FNV-1a 64 -> 8 hex）
+        constexpr size_t MAX_LEN = 200; // 保守选择，避免LLVM内部限制问题
+        auto fnv1a64 = [](const std::string& s) -> uint64_t {
+            uint64_t h = 1469598103934665603ULL; // FNV offset basis
+            for (unsigned char ch : s) {
+                h ^= ch;
+                h *= 1099511628211ULL; // FNV prime
+            }
+            return h;
+        };
+        auto to_hex8 = [](uint64_t v) -> std::string {
+            const char* hex = "0123456789abcdef";
+            std::string out(16, '0'); // 16 hex chars (64-bit)
+            for (int i = 15; i >= 0; --i) { out[i] = hex[v & 0xF]; v >>= 4; }
+            // 取低8位十六进制以紧凑展示
+            return out.substr(8);
+        };
+
+        if (base.size() > MAX_LEN) {
+            uint64_t h = fnv1a64(base);
+            std::string h8 = to_hex8(h);
+            // 预留 '_' + 8 位哈希
+            size_t keep = (MAX_LEN > (1 + h8.size())) ? (MAX_LEN - 1 - h8.size()) : 0;
+            base = base.substr(0, keep) + "_" + h8;
+        }
+
+        // 4) 加上本地/全局前缀
+        return std::string(isGlobal ? "@" : "%") + base;
     }
 
     // 实现所有visit方法（框架代码，不做实际工作）
@@ -137,17 +195,23 @@ namespace sysy
         if (isGlobal)
         {
             // 全局常量 - 生成为全局常量
-            std::string constName = "@" + node->ident;
+            std::string constName = mangleName(node->ident, /*isGlobal*/true, /*dupSuffix*/0);
             if (constEntry) {
                 constEntry->irName = constName;
             }
 
             if (isArray && !dimensions.empty())
             {
-                // 全局常量数组 - 生成为 constant
                 std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
-                // 简化处理：使用 zeroinitializer，实际应该根据 initVal 生成具体的初始值
-                irStream << constName << " = constant " << arrayType << " zeroinitializer\n";
+                int total = getTotalElements(dimensions);
+                std::vector<int> values(total, 0);
+                int linearIndex = 0;
+                if (node->initVal)
+                {
+                    fillConstInitVector(dimensions, 0, node->initVal.get(), linearIndex, values);
+                }
+                std::string constAgg = buildArrayConstant(dimensions, values);
+                irStream << constName << " = constant " << arrayType << " " << constAgg << "\n";
             }
             else
             {
@@ -155,35 +219,36 @@ namespace sysy
                 int initValue = 0;
                 if (node->initVal && node->initVal->isScalar && node->initVal->scalarVal)
                 {
-                    // 计算常量初始值
-                    node->initVal->scalarVal->accept(this);
-                    initValue = std::stoi(currentValue);
+                    // 计算常量初始值（纯常量表达式）
+                    initValue = evaluateConstExp(node->initVal->scalarVal.get());
                 }
                 irStream << constName << " = constant i32 " << initValue << "\n";
             }
         }
         else
         {
-            // 局部常量
-            // 对于局部常量，可以选择生成 alloca 并标记为只读
-            // 或者完全通过符号表内联（当前采用生成 alloca 的方式）
-            std::string constName = "%" + node->ident;
+            // 局部常量 - alloca已在函数入口块生成（alloca hoisting）
+            // 这里只处理初始化
+            
+            // 从pendingAllocas获取已分配的IR名称
+            std::string constName = getNextAllocaIrName(node->ident);
+            
+            // 更新符号表条目的irName
             if (constEntry) {
                 constEntry->irName = constName;
             }
 
             if (isArray && !dimensions.empty())
             {
-                // 局部常量数组
-                std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
-                irStream << "  " << constName << " = alloca " << arrayType << "\n";
-                // 可以添加初始化逻辑
+                // 局部常量数组 - 处理初始化
+                if (node->initVal)
+                {
+                    initializeConstLocalArray(constName, dimensions, node->initVal.get());
+                }
             }
             else
             {
-                // 局部常量标量 - 生成 alloca 并初始化
-                irStream << "  " << constName << " = alloca i32\n";
-
+                // 局部常量标量 - 如果有初始值，生成 store 指令
                 if (node->initVal && node->initVal->isScalar && node->initVal->scalarVal)
                 {
                     node->initVal->scalarVal->accept(this);
@@ -221,7 +286,7 @@ namespace sysy
         if (isGlobal)
         {
             // 全局变量
-            std::string varName = "@" + node->ident;
+            std::string varName = mangleName(node->ident, /*isGlobal*/true, /*dupSuffix*/0);
             if (varEntry) {
                 varEntry->irName = varName;
             }
@@ -230,7 +295,21 @@ namespace sysy
             {
                 // 全局数组
                 std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
-                irStream << varName << " = global " << arrayType << " zeroinitializer\n";
+                if (node->initVal)
+                {
+                    // 有初始化器时，生成完整常量聚合
+                    int total = getTotalElements(dimensions);
+                    std::vector<int> values(total, 0);
+                    int linearIndex = 0;
+                    fillInitVector(dimensions, 0, node->initVal.get(), linearIndex, values);
+                    std::string constAgg = buildArrayConstant(dimensions, values);
+                    irStream << varName << " = global " << arrayType << " " << constAgg << "\n";
+                }
+                else
+                {
+                    // 无初始化器时，使用 zeroinitializer
+                    irStream << varName << " = global " << arrayType << " zeroinitializer\n";
+                }
             }
             else
             {
@@ -257,54 +336,28 @@ namespace sysy
         }
         else
         {
-            // 局部变量 - 生成 alloca 指令
-            // 根本性修复：使用唯一的IR名称，避免不同作用域的变量重名
-            // 在LLVM IR中，每个局部变量必须有唯一的名称
-            std::string varName = "%" + node->ident;
+            // 局部变量 - alloca已在函数入口块生成（alloca hoisting）
+            // 这里只处理初始化
             
-            // 为了避免重名（例如不同if分支中的同名变量），我们需要检查并生成唯一名称
-            // 解决方案：使用全局计数器为每个变量名生成唯一后缀
+            // 从pendingAllocas获取已分配的IR名称
+            std::string varName = getNextAllocaIrName(node->ident);
+            
+            // 更新符号表条目的irName
             if (varEntry) {
-                // 使用静态map记录每个变量名在当前函数中出现的次数
-                // 使用作用域指针的地址作为唯一标识
-                static std::map<void*, std::map<std::string, int>> funcVarCounters;
-                void* funcScope = symbolTableManager->getCurrentScope();
-                
-                auto& varCounter = funcVarCounters[funcScope];
-                
-                if (varCounter.find(node->ident) != varCounter.end()) {
-                    // 已经存在同名变量，使用计数器生成唯一名称
-                    int count = varCounter[node->ident];
-                    varCounter[node->ident]++;
-                    varName = "%" + node->ident + std::to_string(count);
-                } else {
-                    // 第一次出现，记录但不添加后缀
-                    varCounter[node->ident] = 1;
-                    varName = "%" + node->ident;
-                }
-                
                 varEntry->irName = varName;
             }
 
             if (isArray && !dimensions.empty())
             {
-                // 局部数组
-                std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
-                irStream << "  " << varName << " = alloca " << arrayType << "\n";
-                
-                // 修复：处理数组初始化
+                // 局部数组 - 处理初始化
                 if (node->initVal)
                 {
-                    std::vector<int> indices;
-                    initializeArrayRecursive(varName, dimensions, node->initVal.get(), 0, indices);
+                    initializeLocalArray(varName, dimensions, node->initVal.get());
                 }
             }
             else
             {
-                // 局部标量
-                irStream << "  " << varName << " = alloca i32\n";
-
-                // 如果有初始值，生成 store 指令
+                // 局部标量 - 如果有初始值，生成 store 指令
                 if (node->initVal)
                 {
                     node->initVal->accept(this);
@@ -332,7 +385,7 @@ namespace sysy
         else
         {
             // 数组初始化 - 这个函数现在主要用于表达式求值
-            // 实际的数组初始化在 visitVarDef 中通过 initializeArrayRecursive 处理
+            // 实际的数组初始化在 visitVarDef 中通过 initializeLocalArray 处理
             for (auto &val : node->arrayVals)
             {
                 val->accept(this);
@@ -340,119 +393,407 @@ namespace sysy
         }
     }
     
-    // 数组初始化辅助函数：递归处理多维数组初始化
-    void CodeGenerator::initializeArrayRecursive(const std::string& arrayName, 
-                                                  const std::vector<int>& dimensions,
-                                                  InitValNode* initVal, 
-                                                  int currentDim,
-                                                  std::vector<int>& indices)
+    int CodeGenerator::getTotalElements(const std::vector<int> &dimensions)
     {
-        if (!initVal || currentDim >= static_cast<int>(dimensions.size())) return;
-        
-        if (initVal->isScalar)
+        int total = 1;
+        for (int dim : dimensions)
         {
-            // 标量值：扁平化初始化（如 {1, 2, 3, 4} 用于二维数组）
-            // 需要计算当前标量值应该存储到哪个位置
-            int flatIndex = 0;
-            int multiplier = 1;
-            for (int i = static_cast<int>(indices.size()); i < static_cast<int>(dimensions.size()); ++i)
+            total *= dim;
+        }
+        return total;
+    }
+
+    std::vector<int> CodeGenerator::linearToIndices(int linearIndex, const std::vector<int> &dimensions)
+    {
+        std::vector<int> indices(dimensions.size(), 0);
+        int remainder = linearIndex;
+        for (size_t i = 0; i < dimensions.size(); ++i)
+        {
+            int stride = 1;
+            for (size_t j = i + 1; j < dimensions.size(); ++j)
             {
-                multiplier *= dimensions[i];
+                stride *= dimensions[j];
             }
-            for (size_t i = 0; i < indices.size(); ++i)
+            if (stride != 0)
             {
-                int localMultiplier = 1;
-                for (size_t j = i + 1; j < dimensions.size(); ++j)
-                {
-                    localMultiplier *= dimensions[j];
-                }
-                flatIndex += indices[i] * localMultiplier;
+                indices[i] = remainder / stride;
+                remainder %= stride;
             }
-            
-            // 补齐索引到完整维度
-            std::vector<int> fullIndices = indices;
-            while (static_cast<int>(fullIndices.size()) < static_cast<int>(dimensions.size()))
-            {
-                int remainingFlat = flatIndex;
-                for (size_t i = fullIndices.size() + 1; i < dimensions.size(); ++i)
-                {
-                    remainingFlat /= dimensions[i];
-                }
-                fullIndices.push_back(remainingFlat % dimensions[fullIndices.size()]);
-            }
-            
-            // 计算元素地址
-            std::string ptrReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << ptrReg << " = getelementptr ";
-            irStream << getLLVMArrayType(DataType::INT, dimensions);
-            irStream << ", " << getLLVMArrayType(DataType::INT, dimensions) << "* ";
-            irStream << arrayName;
-            irStream << ", i32 0";
-            for (int idx : fullIndices)
-            {
-                irStream << ", i32 " << idx;
-            }
-            irStream << "\n";
-            
-            // 求值并存储
-            initVal->scalarVal->accept(this);
-            irStream << "  store i32 " << currentValue << ", i32* " << ptrReg << "\n";
+        }
+        return indices;
+    }
+
+    std::string CodeGenerator::emitArrayElementPtr(const std::string &arrayName, const std::vector<int> &dimensions,
+                                                   const std::vector<int> &indices)
+    {
+        std::string ptrReg = "%t" + std::to_string(tempCounter++);
+        irStream << "  " << ptrReg << " = getelementptr ";
+        irStream << getLLVMArrayType(DataType::INT, dimensions);
+        irStream << ", " << getLLVMArrayType(DataType::INT, dimensions) << "* " << arrayName;
+        irStream << ", i32 0";
+        for (int idx : indices)
+        {
+            irStream << ", i32 " << idx;
+        }
+        irStream << "\n";
+        return ptrReg;
+    }
+
+    void CodeGenerator::zeroInitializeArray(const std::string &arrayName, const std::vector<int> &dimensions)
+    {
+        int total = getTotalElements(dimensions);
+        // 对于大数组，使用 memset 优化；对于小数组，逐个 store
+        const int MEMSET_THRESHOLD = 64;
+        if (total > MEMSET_THRESHOLD)
+        {
+            // 使用 llvm.memset 进行零初始化
+            std::string arrayType = getLLVMArrayType(DataType::INT, dimensions);
+            std::string ptrReg = "%memset_ptr" + std::to_string(tempCounter++);
+            irStream << "  " << ptrReg << " = bitcast " << arrayType << "* " << arrayName << " to i8*\n";
+            int byteSize = total * 4; // i32 = 4 bytes
+            irStream << "  call void @llvm.memset.p0i8.i64(i8* " << ptrReg << ", i8 0, i64 " << byteSize << ", i1 false)\n";
         }
         else
         {
-            // 数组值：递归处理
-            int dimSize = dimensions[currentDim];
-            int providedValues = static_cast<int>(initVal->arrayVals.size());
-            
-            for (int i = 0; i < dimSize && i < providedValues; ++i)
+            for (int i = 0; i < total; ++i)
             {
-                indices.push_back(i);
-                
-                if (currentDim + 1 < static_cast<int>(dimensions.size()))
-                {
-                    // 还有更多维度，继续递归
-                    if (initVal->arrayVals[i]->isScalar)
-                    {
-                        // 扁平化初始化：标量值直接存储
-                        initializeArrayRecursive(arrayName, dimensions, 
-                                                initVal->arrayVals[i].get(), 
-                                                currentDim + 1, indices);
-                    }
-                    else
-                    {
-                        // 嵌套数组初始化
-                        initializeArrayRecursive(arrayName, dimensions, 
-                                                initVal->arrayVals[i].get(), 
-                                                currentDim + 1, indices);
-                    }
-                }
-                else
-                {
-                    // 最后一维，处理标量值
-                    if (initVal->arrayVals[i]->isScalar && initVal->arrayVals[i]->scalarVal)
-                    {
-                        // 计算元素地址
-                        std::string ptrReg = "%t" + std::to_string(tempCounter++);
-                        irStream << "  " << ptrReg << " = getelementptr ";
-                        irStream << getLLVMArrayType(DataType::INT, dimensions);
-                        irStream << ", " << getLLVMArrayType(DataType::INT, dimensions) << "* ";
-                        irStream << arrayName;
-                        irStream << ", i32 0";
-                        for (int idx : indices)
-                        {
-                            irStream << ", i32 " << idx;
-                        }
-                        irStream << "\n";
-                        
-                        // 求值并存储
-                        initVal->arrayVals[i]->scalarVal->accept(this);
-                        irStream << "  store i32 " << currentValue << ", i32* " << ptrReg << "\n";
-                    }
-                }
-                
-                indices.pop_back();
+                std::vector<int> indices = linearToIndices(i, dimensions);
+                std::string ptrReg = emitArrayElementPtr(arrayName, dimensions, indices);
+                irStream << "  store i32 0, i32* " << ptrReg << "\n";
             }
         }
+    }
+
+    void CodeGenerator::fillArrayFromInit(const std::string &arrayName, const std::vector<int> &dimensions,
+                                          int dimIndex, InitValNode *initVal, int &linearIndex)
+    {
+        if (!initVal)
+            return;
+
+        int total = getTotalElements(dimensions);
+        if (linearIndex >= total)
+            return;
+
+        // 标量：直接写入当前位置
+        if (initVal->isScalar)
+        {
+            if (!initVal->scalarVal)
+                return;
+            std::vector<int> indices = linearToIndices(linearIndex, dimensions);
+            std::string ptrReg = emitArrayElementPtr(arrayName, dimensions, indices);
+            initVal->scalarVal->accept(this);
+            irStream << "  store i32 " << currentValue << ", i32* " << ptrReg << "\n";
+            ++linearIndex;
+            return;
+        }
+
+        // 计算当前维度一个元素所占的标量数量，用于对齐到子聚合边界
+        int stride = 1;
+        for (size_t i = dimIndex + 1; i < dimensions.size(); ++i)
+        {
+            stride *= dimensions[i];
+        }
+
+        for (auto &childPtr : initVal->arrayVals)
+        {
+            if (linearIndex >= total)
+                break;
+
+            InitValNode *child = childPtr.get();
+            if (!child)
+                continue;
+
+            if (child->isScalar && child->scalarVal)
+            {
+                std::vector<int> indices = linearToIndices(linearIndex, dimensions);
+                std::string ptrReg = emitArrayElementPtr(arrayName, dimensions, indices);
+                child->scalarVal->accept(this);
+                irStream << "  store i32 " << currentValue << ", i32* " << ptrReg << "\n";
+                ++linearIndex;
+            }
+            else
+            {
+                int base = ((linearIndex + stride - 1) / stride) * stride;
+                linearIndex = base;
+                fillArrayFromInit(arrayName, dimensions, dimIndex + 1, child, linearIndex);
+                linearIndex = base + stride;
+            }
+        }
+    }
+
+    void CodeGenerator::fillConstArrayFromInit(const std::string &arrayName, const std::vector<int> &dimensions,
+                                               int dimIndex, ConstInitValNode *initVal, int &linearIndex)
+    {
+        if (!initVal)
+            return;
+
+        int total = getTotalElements(dimensions);
+        if (linearIndex >= total)
+            return;
+
+        if (initVal->isScalar)
+        {
+            if (!initVal->scalarVal)
+                return;
+            std::vector<int> indices = linearToIndices(linearIndex, dimensions);
+            std::string ptrReg = emitArrayElementPtr(arrayName, dimensions, indices);
+            initVal->scalarVal->accept(this);
+            irStream << "  store i32 " << currentValue << ", i32* " << ptrReg << "\n";
+            ++linearIndex;
+            return;
+        }
+
+        int stride = 1;
+        for (size_t i = dimIndex + 1; i < dimensions.size(); ++i)
+        {
+            stride *= dimensions[i];
+        }
+
+        for (auto &childPtr : initVal->arrayVals)
+        {
+            if (linearIndex >= total)
+                break;
+
+            ConstInitValNode *child = childPtr.get();
+            if (!child)
+                continue;
+
+            if (child->isScalar && child->scalarVal)
+            {
+                std::vector<int> indices = linearToIndices(linearIndex, dimensions);
+                std::string ptrReg = emitArrayElementPtr(arrayName, dimensions, indices);
+                child->scalarVal->accept(this);
+                irStream << "  store i32 " << currentValue << ", i32* " << ptrReg << "\n";
+                ++linearIndex;
+            }
+            else
+            {
+                int base = ((linearIndex + stride - 1) / stride) * stride;
+                linearIndex = base;
+                fillConstArrayFromInit(arrayName, dimensions, dimIndex + 1, child, linearIndex);
+                linearIndex = base + stride;
+            }
+        }
+    }
+
+    void CodeGenerator::initializeConstLocalArray(const std::string &arrayName, const std::vector<int> &dimensions, ConstInitValNode *initVal)
+    {
+        if (!initVal)
+            return;
+
+        zeroInitializeArray(arrayName, dimensions);
+
+        int linearIndex = 0;
+        fillConstArrayFromInit(arrayName, dimensions, 0, initVal, linearIndex);
+    }
+
+    void CodeGenerator::fillConstInitVector(const std::vector<int> &dimensions, int dimIndex,
+                                            ConstInitValNode *initVal, int &linearIndex, std::vector<int> &values)
+    {
+        if (!initVal)
+            return;
+
+        int total = getTotalElements(dimensions);
+        if (linearIndex >= total)
+            return;
+
+        if (initVal->isScalar)
+        {
+            if (!initVal->scalarVal)
+                return;
+            values[linearIndex++] = evaluateConstExp(initVal->scalarVal.get());
+            return;
+        }
+
+        int stride = 1;
+        for (size_t i = dimIndex + 1; i < dimensions.size(); ++i)
+        {
+            stride *= dimensions[i];
+        }
+
+        for (auto &childPtr : initVal->arrayVals)
+        {
+            if (linearIndex >= total)
+                break;
+
+            ConstInitValNode *child = childPtr.get();
+            if (!child)
+                continue;
+
+            if (child->isScalar && child->scalarVal)
+            {
+                values[linearIndex++] = evaluateConstExp(child->scalarVal.get());
+            }
+            else
+            {
+                int base = ((linearIndex + stride - 1) / stride) * stride;
+                linearIndex = base;
+                fillConstInitVector(dimensions, dimIndex + 1, child, linearIndex, values);
+                linearIndex = base + stride;
+            }
+        }
+    }
+
+    void CodeGenerator::fillInitVector(const std::vector<int> &dimensions, int dimIndex,
+                                       InitValNode *initVal, int &linearIndex, std::vector<int> &values)
+    {
+        if (!initVal)
+            return;
+
+        int total = getTotalElements(dimensions);
+        if (linearIndex >= total)
+            return;
+
+        if (initVal->isScalar)
+        {
+            if (!initVal->scalarVal)
+                return;
+            AddExpNode *addExp = dynamic_cast<AddExpNode *>(initVal->scalarVal.get());
+            int val = 0;
+            if (addExp)
+            {
+                val = evaluateAddExp(addExp);
+            }
+            values[linearIndex++] = val;
+            return;
+        }
+
+        int stride = 1;
+        for (size_t i = dimIndex + 1; i < dimensions.size(); ++i)
+        {
+            stride *= dimensions[i];
+        }
+
+        for (auto &childPtr : initVal->arrayVals)
+        {
+            if (linearIndex >= total)
+                break;
+
+            InitValNode *child = childPtr.get();
+            if (!child)
+                continue;
+
+            if (child->isScalar && child->scalarVal)
+            {
+                AddExpNode *addExp = dynamic_cast<AddExpNode *>(child->scalarVal.get());
+                int val = 0;
+                if (addExp)
+                {
+                    val = evaluateAddExp(addExp);
+                }
+                values[linearIndex++] = val;
+            }
+            else
+            {
+                int base = ((linearIndex + stride - 1) / stride) * stride;
+                linearIndex = base;
+                fillInitVector(dimensions, dimIndex + 1, child, linearIndex, values);
+                linearIndex = base + stride;
+            }
+        }
+    }
+
+    std::string CodeGenerator::buildArrayConstantRecursive(const std::vector<int> &dimensions, const std::vector<int> &values,
+                                                           int dimIndex, int &linearIndex)
+    {
+        bool isLast = (dimIndex == static_cast<int>(dimensions.size()) - 1);
+        int count = dimensions[dimIndex];
+        std::ostringstream oss;
+        oss << "[";
+
+        for (int i = 0; i < count; ++i)
+        {
+            if (i > 0)
+                oss << ", ";
+
+            if (isLast)
+            {
+                oss << "i32 " << values[linearIndex++];
+            }
+            else
+            {
+                std::vector<int> subDims(dimensions.begin() + dimIndex + 1, dimensions.end());
+                std::string elemType = getLLVMArrayType(DataType::INT, subDims);
+                std::string sub = buildArrayConstantRecursive(dimensions, values, dimIndex + 1, linearIndex);
+                oss << elemType << " " << sub;
+            }
+        }
+
+        oss << "]";
+        return oss.str();
+    }
+
+    std::string CodeGenerator::buildArrayConstant(const std::vector<int> &dimensions, const std::vector<int> &values)
+    {
+        int idx = 0;
+        return buildArrayConstantRecursive(dimensions, values, 0, idx);
+    }
+
+    // 计算多维数组参数的线性索引
+    // 对于 int a[][d0][d1]...，索引 [i0][i1][i2]... 的线性索引计算方式：
+    // linearIndex = i0 * (d0 * d1 * ...) + i1 * (d1 * ...) + i2 * ...
+    // 需要生成 mul/add IR 指令序列来动态计算
+    std::string CodeGenerator::computeLinearIndex(const std::vector<std::string>& indexValues, const std::vector<int>& arrayDims)
+    {
+        // 如果只有一个索引，直接返回
+        if (indexValues.size() == 1) {
+            return indexValues[0];
+        }
+        
+        // 外部计数器变量已定义在文件开头
+        extern int tempCounter;
+        
+        // 首先计算每个维度的 stride（步长）
+        // 对于 int a[][5]，stride[0] = 5, stride[1] = 1
+        // 对于 int a[][3][4]，stride[0] = 3*4 = 12, stride[1] = 4, stride[2] = 1
+        std::vector<int> strides(indexValues.size(), 1);
+        for (int i = static_cast<int>(indexValues.size()) - 2; i >= 0; --i) {
+            // strides[i] = strides[i+1] * arrayDims[i]
+            // arrayDims[i] 是第 i+1 个维度的大小（因为第一维是缺失的）
+            if (static_cast<size_t>(i) < arrayDims.size()) {
+                strides[i] = strides[i + 1] * arrayDims[i];
+            } else {
+                strides[i] = strides[i + 1];
+            }
+        }
+        
+        // 生成 linearIndex = sum(indexValues[i] * strides[i])
+        std::string result = "";
+        
+        for (size_t i = 0; i < indexValues.size(); ++i) {
+            std::string term;
+            if (strides[i] == 1) {
+                term = indexValues[i];
+            } else {
+                // term = indexValues[i] * strides[i]
+                std::string mulReg = "%t" + std::to_string(tempCounter++);
+                irStream << "  " << mulReg << " = mul i32 " << indexValues[i] << ", " << strides[i] << "\n";
+                term = mulReg;
+            }
+            
+            if (result.empty()) {
+                result = term;
+            } else {
+                // result = result + term
+                std::string addReg = "%t" + std::to_string(tempCounter++);
+                irStream << "  " << addReg << " = add i32 " << result << ", " << term << "\n";
+                result = addReg;
+            }
+        }
+        
+        return result;
+    }
+
+    void CodeGenerator::initializeLocalArray(const std::string &arrayName, const std::vector<int> &dimensions, InitValNode *initVal)
+    {
+        if (!initVal)
+            return;
+
+        // 先将所有元素置零，保证未提供的值默认为0
+        zeroInitializeArray(arrayName, dimensions);
+
+        int linearIndex = 0;
+        fillArrayFromInit(arrayName, dimensions, 0, initVal, linearIndex);
     }
 
     void CodeGenerator::visitFuncDef(FuncDefNode *node)
@@ -493,6 +834,11 @@ namespace sysy
         }
         irStream << ") {\n";
 
+        // 在任何指令之前生成入口基本块标签
+        std::string entryLabel = generateLabel("entry");
+        irStream << entryLabel << ":\n";
+        currentBlockLabel = entryLabel;
+
         // 为每个参数调用visitFuncFParam处理
         currentParamIndex = 0;
         for (size_t i = 0; i < node->params.size(); ++i)
@@ -500,19 +846,51 @@ namespace sysy
             currentParamIndex = i;
             node->params[i]->accept(this);
         }
+        
+        // ========== Alloca Hoisting: 先收集所有局部变量，在入口块生成alloca ==========
+        if (node->block)
+        {
+            collectLocalVars(node->block.get());
+            
+            // 在入口块生成所有alloca指令
+            for (auto& info : pendingAllocas)
+                {
+                if (info.entry) {
+                    info.entry->irName = info.irName;
+                }
+                
+                if (info.isArray && !info.dimensions.empty())
+                {
+                    std::string arrayType = getLLVMArrayType(DataType::INT, info.dimensions);
+                    irStream << "  " << info.irName << " = alloca " << arrayType << "\n";
+                }
+                else
+                {
+                    irStream << "  " << info.irName << " = alloca i32\n";
+                }
+            }
+            
+            // 重置alloca索引，用于visitVarDef/visitConstDef匹配
+            currentAllocaIndex = 0;
+        }
 
         // 生成函数体
         bool hasReturn = false;
         if (node->block)
         {
-            // 遍历块项目，但不生成额外的大括号
+            // 设置标志，表示即将处理函数首块
+            inFunctionFirstBlock = true;
+            
+            // 通过 accept 调用 visitBlockStmt，这样内层块也会被正确处理
+            node->block->accept(this);
+            
+            // 检查是否有 return 语句
             for (auto &item : node->block->blockItems)
             {
-                item->accept(this);
-                // 检查最后一个语句是否为 return（简化判断）
                 if (item->stmt && dynamic_cast<ReturnStmtNode *>(item->stmt.get()))
                 {
                     hasReturn = true;
+                    break;
                 }
             }
         }
@@ -553,7 +931,7 @@ namespace sysy
         }
 
         // 生成参数的局部变量名
-        std::string paramName = "%" + node->ident;
+        std::string paramName = mangleName(node->ident, /*isGlobal*/false, /*dupSuffix*/0);
         varEntry->irName = paramName;
 
         if (node->isArray)
@@ -572,10 +950,24 @@ namespace sysy
 
     void CodeGenerator::visitBlockStmt(BlockStmtNode *node)
     {
+        // 使用标志判断是否为函数首块
+        bool isFirstBlockInFunc = inFunctionFirstBlock;
+        inFunctionFirstBlock = false;  // 重置标志，后续块都不是首块
+        
+        bool enteredScope = false;
+        if (!isFirstBlockInFunc) {
+            // 进入语义分析时已创建的子作用域（不创建新的）
+            enteredScope = symbolTableManager->enterExistingChildScope();
+        }
+        
         // 遍历所有块项目
         for (auto &item : node->blockItems)
         {
             item->accept(this);
+        }
+        
+        if (enteredScope) {
+            symbolTableManager->exitExistingScope();
         }
     }
 
@@ -600,21 +992,29 @@ namespace sysy
             std::string rhsValue = currentValue;
 
             // 获取左值地址
-            SymbolEntry *entry = symbolTableManager->lookup(node->lVal->ident);
+            // 查找变量，需要找到已经有 irName 的那个（已声明的）
+            SymbolEntry *entry = nullptr;
+            SymbolTable* scope = symbolTableManager->getCurrentScope();
+            while (scope != nullptr) {
+                SymbolEntry* found = scope->lookup(node->lVal->ident);
+                if (found) {
+                    VariableEntry* varFound = dynamic_cast<VariableEntry*>(found);
+                    if (varFound && !varFound->irName.empty()) {
+                        entry = found;
+                        break;
+                    }
+                }
+                scope = scope->getParent();
+            }
+            
             if (!entry) {
-                std::cerr << "Error: Variable '" << node->lVal->ident << "' not found in symbol table" << std::endl;
+                std::cerr << "Error: Variable '" << node->lVal->ident << "' not found in symbol table or has no IR name" << std::endl;
                 return;
             }
 
             VariableEntry *varEntry = dynamic_cast<VariableEntry *>(entry);
             if (!varEntry) {
                 std::cerr << "Error: '" << node->lVal->ident << "' is not a variable" << std::endl;
-                return;
-            }
-            
-            // 检查变量是否已经生成了IR名称（即是否已经定义了）
-            if (varEntry->irName.empty()) {
-                std::cerr << "Error: Variable '" << node->lVal->ident << "' has not been defined (no IR name)" << std::endl;
                 return;
             }
 
@@ -673,12 +1073,11 @@ namespace sysy
                             irStream << "  " << loadedPtr << " = load i32*, i32** " << basePtr << "\n";
                             basePtr = loadedPtr;
                             
-                            // 数组参数：使用 i32* 类型，直接索引
+                            // 数组参数：使用 i32* 类型，需要计算线性索引
+                            // 对于 int a[][5]，访问 a[i][j] 需要计算 i * 5 + j
+                            std::string linearIndex = computeLinearIndex(indexValues, paramEntry->arrayDims);
                             irStream << "  " << ptrReg << " = getelementptr i32, i32* " << basePtr;
-                            for (const auto &idx : indexValues)
-                            {
-                                irStream << ", i32 " << idx;
-                            }
+                            irStream << ", i32 " << linearIndex;
                             irStream << "\n";
                         }
                         else
@@ -744,6 +1143,7 @@ namespace sysy
 
         // then分支
         irStream << thenLabel << ":\n";
+        currentBlockLabel = thenLabel;
         if (node->thenStmt)
         {
             node->thenStmt->accept(this);
@@ -754,12 +1154,14 @@ namespace sysy
         if (node->elseStmt)
         {
             irStream << elseLabel << ":\n";
+            currentBlockLabel = elseLabel;
             node->elseStmt->accept(this);
             irStream << "  br label %" << endLabel << "\n";
         }
 
         // 结束标签
         irStream << endLabel << ":\n";
+        currentBlockLabel = endLabel;
     }
 
     void CodeGenerator::visitWhileStmt(WhileStmtNode *node)
@@ -782,6 +1184,7 @@ namespace sysy
 
         // 条件判断块
         irStream << condLabel << ":\n";
+        currentBlockLabel = condLabel;
         if (node->cond)
         {
             node->cond->accept(this);
@@ -792,6 +1195,7 @@ namespace sysy
 
         // 循环体
         irStream << bodyLabel << ":\n";
+        currentBlockLabel = bodyLabel;
         if (node->body)
         {
             node->body->accept(this);
@@ -800,6 +1204,7 @@ namespace sysy
 
         // 结束标签
         irStream << endLabel << ":\n";
+        currentBlockLabel = endLabel;
 
         // 恢复之前的break/continue目标
         currentBreakTarget = oldBreak;
@@ -936,6 +1341,7 @@ namespace sysy
                 std::string extReg = "%t" + std::to_string(tempCounter++);
                 irStream << "  " << extReg << " = zext i1 " << resultReg << " to i32\n";
                 currentValue = extReg;
+                condResultReg = resultReg; // 供条件使用
             }
         }
         else if (node->primaryExp)
@@ -968,10 +1374,23 @@ namespace sysy
 
     void CodeGenerator::visitLVal(LValNode *node)
     {
-        // 查找符号表条目
-        SymbolEntry *entry = symbolTableManager->lookup(node->ident);
+        // 查找符号表条目 - 需要找到已经有 irName 的那个（已声明的）
+        SymbolEntry *entry = nullptr;
+        SymbolTable* scope = symbolTableManager->getCurrentScope();
+        while (scope != nullptr) {
+            SymbolEntry* found = scope->lookup(node->ident);
+            if (found) {
+                VariableEntry* varFound = dynamic_cast<VariableEntry*>(found);
+                if (varFound && !varFound->irName.empty()) {
+                    entry = found;
+                    break;
+                }
+            }
+            scope = scope->getParent();
+        }
+        
         if (!entry) {
-            std::cerr << "Error: Variable '" << node->ident << "' not found in symbol table" << std::endl;
+            std::cerr << "Error: Variable '" << node->ident << "' not found in symbol table or has no IR name" << std::endl;
             // 设置一个默认值，避免后续代码崩溃
             currentValue = "0";
             return;
@@ -980,14 +1399,6 @@ namespace sysy
         VariableEntry *varEntry = dynamic_cast<VariableEntry *>(entry);
         if (!varEntry) {
             std::cerr << "Error: '" << node->ident << "' is not a variable" << std::endl;
-            // 设置一个默认值，避免后续代码崩溃
-            currentValue = "0";
-            return;
-        }
-        
-        // 检查变量是否已经生成了IR名称（即是否已经定义了）
-        if (varEntry->irName.empty()) {
-            std::cerr << "Error: Variable '" << node->ident << "' has not been defined (no IR name)" << std::endl;
             // 设置一个默认值，避免后续代码崩溃
             currentValue = "0";
             return;
@@ -1015,19 +1426,31 @@ namespace sysy
                     std::string resultReg = "%t" + std::to_string(tempCounter++);
                     if (varEntry->getScopeLevel() == 0)
                     {
-                        // 全局数组
+                        // 全局数组：需要足够多的 i32 0 索引来获取 i32*
                         irStream << "  " << resultReg << " = getelementptr ";
                         irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
                         irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
-                        irStream << varEntry->irName << ", i32 0, i32 0\n";
+                        irStream << varEntry->irName;
+                        // 第一个 i32 0 是访问数组本身，后续每一个 i32 0 深入一个维度
+                        for (size_t d = 0; d <= varEntry->dimensions.size(); ++d)
+                        {
+                            irStream << ", i32 0";
+                        }
+                        irStream << "\n";
                     }
                     else
                     {
-                        // 局部数组
+                        // 局部数组：需要足够多的 i32 0 索引来获取 i32*
                         irStream << "  " << resultReg << " = getelementptr ";
                         irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
                         irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
-                        irStream << varEntry->irName << ", i32 0, i32 0\n";
+                        irStream << varEntry->irName;
+                        // 第一个 i32 0 是访问数组本身，后续每一个 i32 0 深入一个维度
+                        for (size_t d = 0; d <= varEntry->dimensions.size(); ++d)
+                        {
+                            irStream << ", i32 0";
+                        }
+                        irStream << "\n";
                     }
                     currentValue = resultReg;
                 }
@@ -1075,8 +1498,9 @@ namespace sysy
                     irStream << ", i32 " << idx;
                 }
                 
-                // 根本性修复：对于部分索引，添加额外的 ", i32 0" 来获取 i32* 而不是子数组指针
-                // 这样 c[0] 会返回 i32* 而不是 [4 x i32]*
+                // 对于部分索引（如多维数组只索引前几维），需要额外添加 i32 0 来获取指向元素的指针
+                // 例如：buf[0]（其中 buf 是 [2][100]）应该生成 getelementptr ... @buf, i32 0, i32 0, i32 0
+                // 这样才能返回 i32* 而不是 [100 x i32]*
                 if (isPartialIndex)
                 {
                     irStream << ", i32 0";
@@ -1100,12 +1524,11 @@ namespace sysy
                     irStream << "  " << loadedPtr << " = load i32*, i32** " << basePtr << "\n";
                     basePtr = loadedPtr;
                     
-                    // 数组参数：使用 i32* 类型，直接索引
+                    // 数组参数：使用 i32* 类型，需要计算线性索引
+                    // 对于 int a[][5]，访问 a[i][j] 需要计算 i * 5 + j
+                    std::string linearIndex = computeLinearIndex(indexValues, paramEntry->arrayDims);
                     irStream << "  " << ptrReg << " = getelementptr i32, i32* " << basePtr;
-                    for (const auto &idx : indexValues)
-                    {
-                        irStream << ", i32 " << idx;
-                    }
+                    irStream << ", i32 " << linearIndex;
                     irStream << "\n";
                 }
                 else
@@ -1125,7 +1548,7 @@ namespace sysy
                         irStream << ", i32 " << idx;
                     }
                     
-                    // 根本性修复：对于部分索引，添加额外的 ", i32 0" 来获取 i32* 而不是子数组指针
+                    // 对于部分索引，添加额外的 i32 0 来获取指向元素的指针
                     if (isPartialIndex)
                     {
                         irStream << ", i32 0";
@@ -1184,6 +1607,13 @@ namespace sysy
         std::vector<std::string> argValues;
         std::vector<std::string> argTypes;
         
+        // 获取系统函数的参数类型（如果是系统函数）
+        std::vector<std::string> sysFuncParamTypes;
+        if (isSystemFunc)
+        {
+            sysFuncParamTypes = getSystemFunctionParamTypes(node->ident);
+        }
+        
         for (size_t i = 0; i < node->args.size(); ++i)
         {
             node->args[i]->accept(this);
@@ -1191,8 +1621,14 @@ namespace sysy
             
             // 确定参数类型
             std::string paramType = "i32";  // 默认类型
-            if (funcEntry && i < static_cast<size_t>(funcEntry->getParameterCount()))
+            if (isSystemFunc && i < sysFuncParamTypes.size())
             {
+                // 对于系统函数，使用系统函数定义的参数类型
+                paramType = sysFuncParamTypes[i];
+            }
+            else if (funcEntry && i < static_cast<size_t>(funcEntry->getParameterCount()))
+            {
+                // 对于用户定义函数，从符号表获取参数类型
                 VariableEntry *param = funcEntry->getParameter(static_cast<int>(i));
                 if (param) {
                     ParameterEntry *paramEntry = dynamic_cast<ParameterEntry *>(param);
@@ -1321,33 +1757,50 @@ namespace sysy
             std::string cmpReg = "%t" + std::to_string(tempCounter++);
             irStream << "  " << cmpReg << " = icmp ne i32 " << currentValue << ", 0\n";
             condResultReg = cmpReg;
+            // 表达式值为 i32 0/1
+            std::string extReg = "%t" + std::to_string(tempCounter++);
+            irStream << "  " << extReg << " = zext i1 " << cmpReg << " to i32\n";
+            currentValue = extReg;
         }
         else
         {
-            // 二元操作 - 短路求值
+            // 二元操作 - 短路求值（控制流 + phi）
             node->left->accept(this);
             std::string leftVal = currentValue;
 
-            // 将左操作数转换为bool
+            // 左操作数转为 i1
             std::string leftCmp = "%t" + std::to_string(tempCounter++);
             irStream << "  " << leftCmp << " = icmp ne i32 " << leftVal << ", 0\n";
 
+            // 构造基本块
+            std::string rhsLabel = generateLabel("and.rhs");
+            std::string endLabel = generateLabel("and.end");
+            // 记录左分支所在前驱块标签，用于 phi
+            std::string lhsPred = currentBlockLabel;
+            // 依据左值进行跳转：false -> end，true -> rhs
+            irStream << "  br i1 " << leftCmp << ", label %" << rhsLabel << ", label %" << endLabel << "\n";
+
+            // 右侧块
+            irStream << rhsLabel << ":\n";
+            currentBlockLabel = rhsLabel;
             node->right->accept(this);
             std::string rightVal = currentValue;
-
-            // 将右操作数转换为bool
             std::string rightCmp = "%t" + std::to_string(tempCounter++);
             irStream << "  " << rightCmp << " = icmp ne i32 " << rightVal << ", 0\n";
+            // 记录右侧实际前驱（可能被嵌套表达式更新）
+            std::string rightPred = currentBlockLabel;
+            irStream << "  br label %" << endLabel << "\n";
 
-            // 逻辑与操作
-            std::string andReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << andReg << " = and i1 " << leftCmp << ", " << rightCmp << "\n";
-
-            // 转换为i32
+            // 合并块
+            irStream << endLabel << ":\n";
+            std::string phiReg = "%t" + std::to_string(tempCounter++);
+            irStream << "  " << phiReg << " = phi i1 [ false, %" << lhsPred << " ], [ " << rightCmp << ", %" << rightPred << " ]\n";
+            currentBlockLabel = endLabel;
+            // 设置表达式与条件结果
             std::string extReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << extReg << " = zext i1 " << andReg << " to i32\n";
+            irStream << "  " << extReg << " = zext i1 " << phiReg << " to i32\n";
             currentValue = extReg;
-            condResultReg = andReg;
+            condResultReg = phiReg;
         }
     }
 
@@ -1361,33 +1814,48 @@ namespace sysy
             std::string cmpReg = "%t" + std::to_string(tempCounter++);
             irStream << "  " << cmpReg << " = icmp ne i32 " << currentValue << ", 0\n";
             condResultReg = cmpReg;
+            std::string extReg = "%t" + std::to_string(tempCounter++);
+            irStream << "  " << extReg << " = zext i1 " << cmpReg << " to i32\n";
+            currentValue = extReg;
         }
         else
         {
-            // 二元操作 - 短路求值
+            // 二元操作 - 短路求值（控制流 + phi）
             node->left->accept(this);
             std::string leftVal = currentValue;
 
-            // 将左操作数转换为bool
+            // 左操作数转为 i1
             std::string leftCmp = "%t" + std::to_string(tempCounter++);
             irStream << "  " << leftCmp << " = icmp ne i32 " << leftVal << ", 0\n";
 
+            // 构造基本块
+            std::string rhsLabel = generateLabel("or.rhs");
+            std::string endLabel = generateLabel("or.end");
+            // 记录左分支所在前驱块标签，用于 phi
+            std::string lhsPred = currentBlockLabel;
+            // 左值为真则直接到 end，为假则到 rhs
+            irStream << "  br i1 " << leftCmp << ", label %" << endLabel << ", label %" << rhsLabel << "\n";
+
+            // 右侧块
+            irStream << rhsLabel << ":\n";
+            currentBlockLabel = rhsLabel;
             node->right->accept(this);
             std::string rightVal = currentValue;
-
-            // 将右操作数转换为bool
             std::string rightCmp = "%t" + std::to_string(tempCounter++);
             irStream << "  " << rightCmp << " = icmp ne i32 " << rightVal << ", 0\n";
+            // 记录右侧实际前驱（可能被嵌套表达式更新）
+            std::string rightPred = currentBlockLabel;
+            irStream << "  br label %" << endLabel << "\n";
 
-            // 逻辑或操作
-            std::string orReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << orReg << " = or i1 " << leftCmp << ", " << rightCmp << "\n";
-
-            // 转换为i32
+            // 合并块
+            irStream << endLabel << ":\n";
+            std::string phiReg = "%t" + std::to_string(tempCounter++);
+            irStream << "  " << phiReg << " = phi i1 [ true, %" << lhsPred << " ], [ " << rightCmp << ", %" << rightPred << " ]\n";
+            currentBlockLabel = endLabel;
             std::string extReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << extReg << " = zext i1 " << orReg << " to i32\n";
+            irStream << "  " << extReg << " = zext i1 " << phiReg << " to i32\n";
             currentValue = extReg;
-            condResultReg = orReg;
+            condResultReg = phiReg;
         }
     }
 
@@ -1533,6 +2001,8 @@ namespace sysy
         irStream << "declare void @putint(i32)\n";
         irStream << "declare void @putch(i32)\n";
         irStream << "declare void @putarray(i32, i32*)\n";
+        // llvm.memset 内置函数声明，用于大数组零初始化
+        irStream << "declare void @llvm.memset.p0i8.i64(i8* nocapture writeonly, i8, i64, i1 immarg)\n";
         irStream << "\n";
     }
 
@@ -1592,4 +2062,201 @@ namespace sysy
         return 0;
     }
 
+    // 获取系统函数的参数类型列表
+    std::vector<std::string> CodeGenerator::getSystemFunctionParamTypes(const std::string &funcName)
+    {
+        std::vector<std::string> paramTypes;
+        
+        if (funcName == "getint" || funcName == "getch")
+        {
+            // 无参数
+        }
+        else if (funcName == "putint" || funcName == "putch")
+        {
+            paramTypes.push_back("i32");
+        }
+        else if (funcName == "getarray")
+        {
+            paramTypes.push_back("i32*");  // getarray 接收数组指针
+        }
+        else if (funcName == "putfloat")
+        {
+            paramTypes.push_back("float");
+        }
+        else if (funcName == "putarray")
+        {
+            paramTypes.push_back("i32");   // 第一个参数：数组长度
+            paramTypes.push_back("i32*");  // 第二个参数：数组指针
+        }
+        else if (funcName == "getfarray")
+        {
+            paramTypes.push_back("float*");
+        }
+        else if (funcName == "putfarray")
+        {
+            paramTypes.push_back("i32");    // 数组长度
+            paramTypes.push_back("float*"); // 数组指针
+        }
+        else if (funcName == "putf")
+        {
+            paramTypes.push_back("i8*");  // 格式字符串指针，可能有更多参数
+        }
+        else if (funcName == "_sysy_starttime" || funcName == "_sysy_stoptime")
+        {
+            paramTypes.push_back("i32");
+        }
+        
+        return paramTypes;
+    }
+
+    // ========== Alloca Hoisting: 收集局部变量 ==========
+    
+    std::string CodeGenerator::getNextAllocaIrName(const std::string& varName)
+    {
+        // 从pendingAllocas中按顺序获取对应的irName
+        if (currentAllocaIndex < pendingAllocas.size())
+        {
+            // 验证变量名匹配
+            if (pendingAllocas[currentAllocaIndex].name == varName)
+            {
+                return pendingAllocas[currentAllocaIndex++].irName;
+            }
+            // 如果不匹配，可能是跳过了某些声明，搜索匹配的
+            for (size_t i = currentAllocaIndex; i < pendingAllocas.size(); ++i)
+            {
+                if (pendingAllocas[i].name == varName)
+                {
+                    currentAllocaIndex = i + 1;
+                    return pendingAllocas[i].irName;
+                }
+            }
+        }
+        // 找不到时返回默认名称（不应该发生）
+        std::cerr << "Warning: Could not find alloca for variable '" << varName << "'" << std::endl;
+        return "%" + varName;
+    }
+    
+    void CodeGenerator::collectLocalVars(BlockStmtNode* block)
+    {
+        pendingAllocas.clear();
+        allocaNameCounters.clear();
+        collectingAllocas = true;
+        collectLocalVarsFromBlock(block);
+        collectingAllocas = false;
+    }
+    
+    void CodeGenerator::collectLocalVarsFromBlock(BlockStmtNode* block)
+    {
+        if (!block) return;
+        
+        for (auto& item : block->blockItems)
+        {
+            if (!item) continue;
+            
+            // 处理声明
+            if (item->isDecl && item->decl)
+            {
+                // 变量声明
+                VarDeclNode* varDecl = dynamic_cast<VarDeclNode*>(item->decl.get());
+                if (varDecl)
+                {
+                    for (auto& def : varDecl->varDefs)
+                    {
+                        if (!def) continue;
+                        
+                        LocalVarInfo info;
+                        info.name = def->ident;
+                        info.entry = nullptr; // 不在这里设置entry
+                        info.isArray = !def->dims.empty();
+                        
+                        // 从AST获取维度
+                        for (auto& dim : def->dims) {
+                            if (dim) {
+                                info.dimensions.push_back(evaluateConstExp(dim.get()));
+                            }
+                        }
+                        
+                        // 生成唯一且安全的IR名称（考虑长度与重复）
+                        if (allocaNameCounters.find(info.name) != allocaNameCounters.end()) {
+                            int count = allocaNameCounters[info.name]++;
+                            info.irName = mangleName(info.name, /*isGlobal*/false, /*dupSuffix*/count);
+                        } else {
+                            allocaNameCounters[info.name] = 1;
+                            info.irName = mangleName(info.name, /*isGlobal*/false, /*dupSuffix*/0);
+                        }
+                        
+                        pendingAllocas.push_back(info);
+                    }
+                }
+                
+                // 常量声明
+                ConstDeclNode* constDecl = dynamic_cast<ConstDeclNode*>(item->decl.get());
+                if (constDecl)
+                {
+                    for (auto& def : constDecl->constDefs)
+                    {
+                        if (!def) continue;
+                        
+                        LocalVarInfo info;
+                        info.name = def->ident;
+                        info.entry = nullptr; // 不在这里设置entry
+                        info.isArray = !def->dims.empty();
+                        
+                        // 从AST获取维度
+                        for (auto& dim : def->dims) {
+                            if (dim) {
+                                info.dimensions.push_back(evaluateConstExp(dim.get()));
+                            }
+                        }
+                        
+                        if (allocaNameCounters.find(info.name) != allocaNameCounters.end()) {
+                            int count = allocaNameCounters[info.name]++;
+                            info.irName = mangleName(info.name, /*isGlobal*/false, /*dupSuffix*/count);
+                        } else {
+                            allocaNameCounters[info.name] = 1;
+                            info.irName = mangleName(info.name, /*isGlobal*/false, /*dupSuffix*/0);
+                        }
+                        
+                        pendingAllocas.push_back(info);
+                    }
+                }
+            }
+            
+            // 递归处理语句中的嵌套块
+            if (item->stmt)
+            {
+                collectLocalVarsFromStmt(item->stmt.get());
+            }
+        }
+    }
+    
+    void CodeGenerator::collectLocalVarsFromStmt(StmtNode* stmt)
+    {
+        if (!stmt) return;
+        
+        // Block语句
+        BlockStmtNode* block = dynamic_cast<BlockStmtNode*>(stmt);
+        if (block) {
+            collectLocalVarsFromBlock(block);
+            return;
+        }
+        
+        // If语句
+        IfStmtNode* ifStmt = dynamic_cast<IfStmtNode*>(stmt);
+        if (ifStmt) {
+            if (ifStmt->thenStmt) collectLocalVarsFromStmt(ifStmt->thenStmt.get());
+            if (ifStmt->elseStmt) collectLocalVarsFromStmt(ifStmt->elseStmt.get());
+            return;
+        }
+        
+        // While语句
+        WhileStmtNode* whileStmt = dynamic_cast<WhileStmtNode*>(stmt);
+        if (whileStmt) {
+            if (whileStmt->body) collectLocalVarsFromStmt(whileStmt->body.get());
+            return;
+        }
+    }
+
 } // namespace sysy
+
+

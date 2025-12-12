@@ -6,6 +6,8 @@
 #include <memory>
 #include <string>
 #include <sstream>
+#include <map>
+#include <vector>
 
 namespace sysy
 {
@@ -26,18 +28,47 @@ namespace sysy
         std::string currentContinueTarget;
         int labelCounter;      // 用于生成唯一的标签名
         int currentParamIndex; // 用于跟踪当前处理的参数索引
+        // 当前基本块标签（用于构造包含 phi 的短路控制流）
+        std::string currentBlockLabel;
+        
+        // 标记是否在处理函数体的首块（首块不创建新作用域）
+        bool inFunctionFirstBlock;
+        
+        // Alloca hoisting: 收集函数内所有局部变量信息
+        struct LocalVarInfo {
+            std::string name;           // 变量名
+            std::string irName;         // 生成的IR名称
+            bool isArray;               // 是否为数组
+            std::vector<int> dimensions; // 数组维度
+            VariableEntry* entry;       // 符号表条目
+        };
+        std::vector<LocalVarInfo> pendingAllocas; // 待生成的alloca
+        bool collectingAllocas;         // 是否处于收集阶段
+        std::map<std::string, int> allocaNameCounters; // 用于生成唯一名称
+        size_t currentAllocaIndex;      // 当前处理的alloca索引
+        
+        // 收集函数体中所有局部变量声明
+        void collectLocalVars(BlockStmtNode* block);
+        void collectLocalVarsFromBlock(BlockStmtNode* block);
+        void collectLocalVarsFromStmt(StmtNode* stmt);
+        
+        // 获取下一个待分配变量的IR名称
+        std::string getNextAllocaIrName(const std::string& varName);
 
         // 辅助方法
         std::string getLLVMType(DataType dataType);
         std::string getLLVMArrayType(DataType elementType, const std::vector<int> &dimensions);
         std::string generateLabel(const std::string &prefix);
         std::string generateVarName(const std::string &name);
+        // 将源标识符规范化为安全且长度受限的LLVM名称，并可附加去重后缀
+        std::string mangleName(const std::string& name, bool isGlobal, int dupSuffix = 0);
         
         // 系统函数处理
         void generateSystemFunctionDeclarations();
         bool isSystemFunction(const std::string &funcName);
         DataType getSystemFunctionReturnType(const std::string &funcName);
         int getSystemFunctionParamCount(const std::string &funcName);
+        std::vector<std::string> getSystemFunctionParamTypes(const std::string &funcName);
         
         // 常量表达式求值（用于全局变量初始值）
         int evaluateConstExp(ConstExpNode* node);
@@ -48,10 +79,28 @@ namespace sysy
         int evaluateLVal(LValNode* node);
         
         // 数组初始化辅助函数
-        void initializeArray(const std::string& arrayName, const std::vector<int>& dimensions, 
-                            InitValNode* initVal, int currentDim, int flatIndex);
-        void initializeArrayRecursive(const std::string& arrayName, const std::vector<int>& dimensions,
-                                     InitValNode* initVal, int currentDim, std::vector<int>& indices);
+        int getTotalElements(const std::vector<int>& dimensions);
+        std::vector<int> linearToIndices(int linearIndex, const std::vector<int>& dimensions);
+        std::string emitArrayElementPtr(const std::string& arrayName, const std::vector<int>& dimensions,
+                           const std::vector<int>& indices);
+        void zeroInitializeArray(const std::string& arrayName, const std::vector<int>& dimensions);
+        void initializeLocalArray(const std::string& arrayName, const std::vector<int>& dimensions, InitValNode* initVal);
+        void fillArrayFromInit(const std::string& arrayName, const std::vector<int>& dimensions,
+                       int dimIndex, InitValNode* initVal, int& linearIndex);
+        void initializeConstLocalArray(const std::string& arrayName, const std::vector<int>& dimensions, ConstInitValNode* initVal);
+        void fillConstArrayFromInit(const std::string& arrayName, const std::vector<int>& dimensions,
+                        int dimIndex, ConstInitValNode* initVal, int& linearIndex);
+        void fillConstInitVector(const std::vector<int>& dimensions, int dimIndex,
+                     ConstInitValNode* initVal, int& linearIndex, std::vector<int>& values);
+        void fillInitVector(const std::vector<int>& dimensions, int dimIndex,
+                    InitValNode* initVal, int& linearIndex, std::vector<int>& values);
+        std::string buildArrayConstant(const std::vector<int>& dimensions, const std::vector<int>& values);
+        std::string buildArrayConstantRecursive(const std::vector<int>& dimensions, const std::vector<int>& values,
+                            int dimIndex, int& linearIndex);
+        
+        // 计算多维数组参数的线性索引
+        // 对于 int a[][d1][d2]...，索引 [i0][i1][i2]... 的线性索引 = i0*d1*d2*... + i1*d2*... + i2*...
+        std::string computeLinearIndex(const std::vector<std::string>& indexValues, const std::vector<int>& arrayDims);
 
     public:
         CodeGenerator(SymbolTableManager *symTabMgr);

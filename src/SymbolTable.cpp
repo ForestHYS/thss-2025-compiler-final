@@ -97,12 +97,69 @@ void SymbolTableManager::exitScope() {
     }
 }
 
+bool SymbolTableManager::enterExistingChildScope() {
+    // 获取当前作用域下一个要访问的子作用域索引
+    // childIndexStack 记录了从根到当前位置，每一层已经访问到了第几个子节点
+    
+    // 检查是否有子作用域可以进入
+    if (currentTable->children.empty()) {
+        return false;
+    }
+    
+    // 确定要进入哪个子作用域
+    // 如果 childIndexStack 的大小等于当前层级，需要获取下一个索引
+    size_t currentDepth = childIndexStack.size();
+    size_t childIndex = 0;
+    
+    // 使用栈来记录每一层的下一个子节点索引
+    if (currentDepth < childIndexStack.size()) {
+        // 不应该发生
+        return false;
+    }
+    
+    // 在当前层级，检查是否还有未访问的子节点
+    // 使用一个 map 来记录每个符号表节点的下一个子节点索引
+    auto it = nextChildIndexMap.find(currentTable);
+    if (it != nextChildIndexMap.end()) {
+        childIndex = it->second;
+    } else {
+        childIndex = 0;
+        nextChildIndexMap[currentTable] = 0;
+    }
+    
+    if (childIndex >= currentTable->children.size()) {
+        return false;  // 没有更多子作用域
+    }
+    
+    // 更新索引
+    nextChildIndexMap[currentTable] = childIndex + 1;
+    
+    // 进入子作用域
+    childIndexStack.push_back(childIndex);
+    currentTable = currentTable->children[childIndex];
+    
+    return true;
+}
+
+void SymbolTableManager::exitExistingScope() {
+    if (currentTable != globalTable.get() && currentTable->parent != nullptr) {
+        currentTable = currentTable->parent;
+        if (!childIndexStack.empty()) {
+            childIndexStack.pop_back();
+        }
+    }
+}
+
 void SymbolTableManager::enterFunction(FunctionEntry* func) {
     if (func->localSymbolTable == nullptr) {
         func->setLocalSymbolTable(new SymbolTable(globalTable.get(), 1));
     }
     functionTable = func->localSymbolTable;
     currentTable = functionTable;
+    
+    // 重置子作用域遍历状态
+    childIndexStack.clear();
+    nextChildIndexMap.clear();
 }
 
 void SymbolTableManager::exitFunction() {

@@ -8,7 +8,8 @@ SemanticAnalyzer::SemanticAnalyzer(SymbolTableManager* symTabMgr)
     : symbolTableManager(symTabMgr), 
       currentFunctionReturnType(DataType::VOID),
       loopDepth(0),
-      hasError(false) {
+      hasError(false),
+      inFunctionFirstBlock(false) {
 }
 
 SemanticAnalyzer::~SemanticAnalyzer() = default;
@@ -357,11 +358,18 @@ void SemanticAnalyzer::visitFuncDef(FuncDefNode* node) {
         paramEntry->isArrayParam = param->isArray;
         paramEntry->isArray = param->isArray;
         
-        // 处理数组参数的维度
+        // 处理数组参数的维度：计算维度值并保存到 arrayDims
         if (param->isArray && !param->dims.empty()) {
             for (auto& dim : param->dims) {
                 if (dim) {
                     dim->accept(this);
+                    // 计算常量维度值并保存
+                    // ExpNode 实际上是 AddExpNode，需要动态转换后求值
+                    AddExpNode* addExp = dynamic_cast<AddExpNode*>(dim.get());
+                    if (addExp) {
+                        int dimValue = evaluateAddExp(addExp);
+                        paramEntry->arrayDims.push_back(dimValue);
+                    }
                 }
             }
         }
@@ -376,6 +384,7 @@ void SemanticAnalyzer::visitFuncDef(FuncDefNode* node) {
         );
         paramForFunc->isArrayParam = paramEntry->isArrayParam;
         paramForFunc->isArray = paramEntry->isArray;
+        paramForFunc->arrayDims = paramEntry->arrayDims;  // 复制数组维度信息
         funcPtr->addParameter(std::move(paramForFunc));
         
         // 添加到符号表
@@ -385,6 +394,7 @@ void SemanticAnalyzer::visitFuncDef(FuncDefNode* node) {
     }
     
     if (node->block) {
+        inFunctionFirstBlock = true;  // 标记即将处理函数首块
         node->block->accept(this);
     }
     
@@ -398,9 +408,9 @@ void SemanticAnalyzer::visitFuncFParam(FuncFParamNode* node) {
 }
 
 void SemanticAnalyzer::visitBlockStmt(BlockStmtNode* node) {
-    // TODO: 优化函数体第一个块的作用域处理
-    bool isFirstBlockInFunc = (symbolTableManager->getCurrentScope()->getScopeLevel() == 1 &&
-                                symbolTableManager->getCurrentScope()->getParent() == symbolTableManager->getGlobalScope());
+    // 使用标志判断是否为函数首块，而不是基于作用域级别判断
+    bool isFirstBlockInFunc = inFunctionFirstBlock;
+    inFunctionFirstBlock = false;  // 重置标志，后续块都不是首块
     
     if (!isFirstBlockInFunc) {
         symbolTableManager->enterScope();
