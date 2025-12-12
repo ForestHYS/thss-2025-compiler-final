@@ -75,7 +75,64 @@ namespace sysy
     std::string CodeGenerator::generateVarName(const std::string &name)
     {
         // 处理变量名，确保符合LLVM IR命名规范
-        return "%" + name;
+        return mangleName(name, /*isGlobal*/false, /*dupSuffix*/0);
+    }
+
+    // 将标识符规范化为安全且长度受限的LLVM名称
+    // 规则：
+    // - 仅保留 [A-Za-z0-9_.$]，其余替换为 '_'
+    // - 可选附加去重后缀（如 1,2,3...）
+    // - 总长度限制为 MAX_LEN，超长则截断并追加 8位十六进制哈希，确保区分
+    std::string CodeGenerator::mangleName(const std::string& name, bool isGlobal, int dupSuffix)
+    {
+        // 1) 合法字符过滤
+        std::string filtered;
+        filtered.reserve(name.size());
+        for (char c : name) {
+            if ((c >= 'A' && c <= 'Z') ||
+                (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') ||
+                c == '_' || c == '.' || c == '$') {
+                filtered.push_back(c);
+            } else {
+                filtered.push_back('_');
+            }
+        }
+
+        // 2) 附加去重后缀（首个不加，后续加 1,2,...）
+        std::string base = filtered;
+        if (dupSuffix > 0) {
+            base += std::to_string(dupSuffix);
+        }
+
+        // 3) 超长截断 + 短哈希（FNV-1a 64 -> 8 hex）
+        constexpr size_t MAX_LEN = 200; // 保守选择，避免LLVM内部限制问题
+        auto fnv1a64 = [](const std::string& s) -> uint64_t {
+            uint64_t h = 1469598103934665603ULL; // FNV offset basis
+            for (unsigned char ch : s) {
+                h ^= ch;
+                h *= 1099511628211ULL; // FNV prime
+            }
+            return h;
+        };
+        auto to_hex8 = [](uint64_t v) -> std::string {
+            const char* hex = "0123456789abcdef";
+            std::string out(16, '0'); // 16 hex chars (64-bit)
+            for (int i = 15; i >= 0; --i) { out[i] = hex[v & 0xF]; v >>= 4; }
+            // 取低8位十六进制以紧凑展示
+            return out.substr(8);
+        };
+
+        if (base.size() > MAX_LEN) {
+            uint64_t h = fnv1a64(base);
+            std::string h8 = to_hex8(h);
+            // 预留 '_' + 8 位哈希
+            size_t keep = (MAX_LEN > (1 + h8.size())) ? (MAX_LEN - 1 - h8.size()) : 0;
+            base = base.substr(0, keep) + "_" + h8;
+        }
+
+        // 4) 加上本地/全局前缀
+        return std::string(isGlobal ? "@" : "%") + base;
     }
 
     // 实现所有visit方法（框架代码，不做实际工作）
@@ -138,7 +195,7 @@ namespace sysy
         if (isGlobal)
         {
             // 全局常量 - 生成为全局常量
-            std::string constName = "@" + node->ident;
+            std::string constName = mangleName(node->ident, /*isGlobal*/true, /*dupSuffix*/0);
             if (constEntry) {
                 constEntry->irName = constName;
             }
@@ -229,7 +286,7 @@ namespace sysy
         if (isGlobal)
         {
             // 全局变量
-            std::string varName = "@" + node->ident;
+            std::string varName = mangleName(node->ident, /*isGlobal*/true, /*dupSuffix*/0);
             if (varEntry) {
                 varEntry->irName = varName;
             }
@@ -797,7 +854,7 @@ namespace sysy
             
             // 在入口块生成所有alloca指令
             for (auto& info : pendingAllocas)
-            {
+                {
                 if (info.entry) {
                     info.entry->irName = info.irName;
                 }
@@ -874,7 +931,7 @@ namespace sysy
         }
 
         // 生成参数的局部变量名
-        std::string paramName = "%" + node->ident;
+        std::string paramName = mangleName(node->ident, /*isGlobal*/false, /*dupSuffix*/0);
         varEntry->irName = paramName;
 
         if (node->isArray)
@@ -2119,13 +2176,13 @@ namespace sysy
                             }
                         }
                         
-                        // 生成唯一的IR名称
+                        // 生成唯一且安全的IR名称（考虑长度与重复）
                         if (allocaNameCounters.find(info.name) != allocaNameCounters.end()) {
                             int count = allocaNameCounters[info.name]++;
-                            info.irName = "%" + info.name + std::to_string(count);
+                            info.irName = mangleName(info.name, /*isGlobal*/false, /*dupSuffix*/count);
                         } else {
                             allocaNameCounters[info.name] = 1;
-                            info.irName = "%" + info.name;
+                            info.irName = mangleName(info.name, /*isGlobal*/false, /*dupSuffix*/0);
                         }
                         
                         pendingAllocas.push_back(info);
@@ -2154,10 +2211,10 @@ namespace sysy
                         
                         if (allocaNameCounters.find(info.name) != allocaNameCounters.end()) {
                             int count = allocaNameCounters[info.name]++;
-                            info.irName = "%" + info.name + std::to_string(count);
+                            info.irName = mangleName(info.name, /*isGlobal*/false, /*dupSuffix*/count);
                         } else {
                             allocaNameCounters[info.name] = 1;
-                            info.irName = "%" + info.name;
+                            info.irName = mangleName(info.name, /*isGlobal*/false, /*dupSuffix*/0);
                         }
                         
                         pendingAllocas.push_back(info);

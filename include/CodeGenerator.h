@@ -60,6 +60,8 @@ namespace sysy
         std::string getLLVMArrayType(DataType elementType, const std::vector<int> &dimensions);
         std::string generateLabel(const std::string &prefix);
         std::string generateVarName(const std::string &name);
+        // 将源标识符规范化为安全且长度受限的LLVM名称，并可附加去重后缀
+        std::string mangleName(const std::string& name, bool isGlobal, int dupSuffix = 0);
         
         // 系统函数处理
         void generateSystemFunctionDeclarations();
