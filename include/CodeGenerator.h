@@ -95,6 +95,10 @@ namespace sysy
         std::string buildArrayConstant(const std::vector<int>& dimensions, const std::vector<int>& values);
         std::string buildArrayConstantRecursive(const std::vector<int>& dimensions, const std::vector<int>& values,
                             int dimIndex, int& linearIndex);
+        
+        // 计算多维数组参数的线性索引
+        // 对于 int a[][d1][d2]...，索引 [i0][i1][i2]... 的线性索引 = i0*d1*d2*... + i1*d2*... + i2*...
+        std::string computeLinearIndex(const std::vector<std::string>& indexValues, const std::vector<int>& arrayDims);
 
     public:
         CodeGenerator(SymbolTableManager *symTabMgr);

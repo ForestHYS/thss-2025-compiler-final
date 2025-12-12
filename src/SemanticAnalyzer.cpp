@@ -358,11 +358,18 @@ void SemanticAnalyzer::visitFuncDef(FuncDefNode* node) {
         paramEntry->isArrayParam = param->isArray;
         paramEntry->isArray = param->isArray;
         
-        // 处理数组参数的维度
+        // 处理数组参数的维度：计算维度值并保存到 arrayDims
         if (param->isArray && !param->dims.empty()) {
             for (auto& dim : param->dims) {
                 if (dim) {
                     dim->accept(this);
+                    // 计算常量维度值并保存
+                    // ExpNode 实际上是 AddExpNode，需要动态转换后求值
+                    AddExpNode* addExp = dynamic_cast<AddExpNode*>(dim.get());
+                    if (addExp) {
+                        int dimValue = evaluateAddExp(addExp);
+                        paramEntry->arrayDims.push_back(dimValue);
+                    }
                 }
             }
         }
@@ -377,6 +384,7 @@ void SemanticAnalyzer::visitFuncDef(FuncDefNode* node) {
         );
         paramForFunc->isArrayParam = paramEntry->isArrayParam;
         paramForFunc->isArray = paramEntry->isArray;
+        paramForFunc->arrayDims = paramEntry->arrayDims;  // 复制数组维度信息
         funcPtr->addParameter(std::move(paramForFunc));
         
         // 添加到符号表

@@ -672,6 +672,61 @@ namespace sysy
         return buildArrayConstantRecursive(dimensions, values, 0, idx);
     }
 
+    // 计算多维数组参数的线性索引
+    // 对于 int a[][d0][d1]...，索引 [i0][i1][i2]... 的线性索引计算方式：
+    // linearIndex = i0 * (d0 * d1 * ...) + i1 * (d1 * ...) + i2 * ...
+    // 需要生成 mul/add IR 指令序列来动态计算
+    std::string CodeGenerator::computeLinearIndex(const std::vector<std::string>& indexValues, const std::vector<int>& arrayDims)
+    {
+        // 如果只有一个索引，直接返回
+        if (indexValues.size() == 1) {
+            return indexValues[0];
+        }
+        
+        // 外部计数器变量已定义在文件开头
+        extern int tempCounter;
+        
+        // 首先计算每个维度的 stride（步长）
+        // 对于 int a[][5]，stride[0] = 5, stride[1] = 1
+        // 对于 int a[][3][4]，stride[0] = 3*4 = 12, stride[1] = 4, stride[2] = 1
+        std::vector<int> strides(indexValues.size(), 1);
+        for (int i = static_cast<int>(indexValues.size()) - 2; i >= 0; --i) {
+            // strides[i] = strides[i+1] * arrayDims[i]
+            // arrayDims[i] 是第 i+1 个维度的大小（因为第一维是缺失的）
+            if (static_cast<size_t>(i) < arrayDims.size()) {
+                strides[i] = strides[i + 1] * arrayDims[i];
+            } else {
+                strides[i] = strides[i + 1];
+            }
+        }
+        
+        // 生成 linearIndex = sum(indexValues[i] * strides[i])
+        std::string result = "";
+        
+        for (size_t i = 0; i < indexValues.size(); ++i) {
+            std::string term;
+            if (strides[i] == 1) {
+                term = indexValues[i];
+            } else {
+                // term = indexValues[i] * strides[i]
+                std::string mulReg = "%t" + std::to_string(tempCounter++);
+                irStream << "  " << mulReg << " = mul i32 " << indexValues[i] << ", " << strides[i] << "\n";
+                term = mulReg;
+            }
+            
+            if (result.empty()) {
+                result = term;
+            } else {
+                // result = result + term
+                std::string addReg = "%t" + std::to_string(tempCounter++);
+                irStream << "  " << addReg << " = add i32 " << result << ", " << term << "\n";
+                result = addReg;
+            }
+        }
+        
+        return result;
+    }
+
     void CodeGenerator::initializeLocalArray(const std::string &arrayName, const std::vector<int> &dimensions, InitValNode *initVal)
     {
         if (!initVal)
@@ -961,12 +1016,11 @@ namespace sysy
                             irStream << "  " << loadedPtr << " = load i32*, i32** " << basePtr << "\n";
                             basePtr = loadedPtr;
                             
-                            // 数组参数：使用 i32* 类型，直接索引
+                            // 数组参数：使用 i32* 类型，需要计算线性索引
+                            // 对于 int a[][5]，访问 a[i][j] 需要计算 i * 5 + j
+                            std::string linearIndex = computeLinearIndex(indexValues, paramEntry->arrayDims);
                             irStream << "  " << ptrReg << " = getelementptr i32, i32* " << basePtr;
-                            for (const auto &idx : indexValues)
-                            {
-                                irStream << ", i32 " << idx;
-                            }
+                            irStream << ", i32 " << linearIndex;
                             irStream << "\n";
                         }
                         else
@@ -1315,19 +1369,31 @@ namespace sysy
                     std::string resultReg = "%t" + std::to_string(tempCounter++);
                     if (varEntry->getScopeLevel() == 0)
                     {
-                        // 全局数组
+                        // 全局数组：需要足够多的 i32 0 索引来获取 i32*
                         irStream << "  " << resultReg << " = getelementptr ";
                         irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
                         irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
-                        irStream << varEntry->irName << ", i32 0, i32 0\n";
+                        irStream << varEntry->irName;
+                        // 第一个 i32 0 是访问数组本身，后续每一个 i32 0 深入一个维度
+                        for (size_t d = 0; d <= varEntry->dimensions.size(); ++d)
+                        {
+                            irStream << ", i32 0";
+                        }
+                        irStream << "\n";
                     }
                     else
                     {
-                        // 局部数组
+                        // 局部数组：需要足够多的 i32 0 索引来获取 i32*
                         irStream << "  " << resultReg << " = getelementptr ";
                         irStream << getLLVMArrayType(DataType::INT, varEntry->dimensions);
                         irStream << ", " << getLLVMArrayType(DataType::INT, varEntry->dimensions) << "* ";
-                        irStream << varEntry->irName << ", i32 0, i32 0\n";
+                        irStream << varEntry->irName;
+                        // 第一个 i32 0 是访问数组本身，后续每一个 i32 0 深入一个维度
+                        for (size_t d = 0; d <= varEntry->dimensions.size(); ++d)
+                        {
+                            irStream << ", i32 0";
+                        }
+                        irStream << "\n";
                     }
                     currentValue = resultReg;
                 }
@@ -1401,12 +1467,11 @@ namespace sysy
                     irStream << "  " << loadedPtr << " = load i32*, i32** " << basePtr << "\n";
                     basePtr = loadedPtr;
                     
-                    // 数组参数：使用 i32* 类型，直接索引
+                    // 数组参数：使用 i32* 类型，需要计算线性索引
+                    // 对于 int a[][5]，访问 a[i][j] 需要计算 i * 5 + j
+                    std::string linearIndex = computeLinearIndex(indexValues, paramEntry->arrayDims);
                     irStream << "  " << ptrReg << " = getelementptr i32, i32* " << basePtr;
-                    for (const auto &idx : indexValues)
-                    {
-                        irStream << ", i32 " << idx;
-                    }
+                    irStream << ", i32 " << linearIndex;
                     irStream << "\n";
                 }
                 else
