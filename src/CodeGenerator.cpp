@@ -1369,8 +1369,9 @@ namespace sysy
                     irStream << ", i32 " << idx;
                 }
                 
-                // 根本性修复：对于部分索引，添加额外的 ", i32 0" 来获取 i32* 而不是子数组指针
-                // 这样 c[0] 会返回 i32* 而不是 [4 x i32]*
+                // 对于部分索引（如多维数组只索引前几维），需要额外添加 i32 0 来获取指向元素的指针
+                // 例如：buf[0]（其中 buf 是 [2][100]）应该生成 getelementptr ... @buf, i32 0, i32 0, i32 0
+                // 这样才能返回 i32* 而不是 [100 x i32]*
                 if (isPartialIndex)
                 {
                     irStream << ", i32 0";
@@ -1419,7 +1420,7 @@ namespace sysy
                         irStream << ", i32 " << idx;
                     }
                     
-                    // 根本性修复：对于部分索引，添加额外的 ", i32 0" 来获取 i32* 而不是子数组指针
+                    // 对于部分索引，添加额外的 i32 0 来获取指向元素的指针
                     if (isPartialIndex)
                     {
                         irStream << ", i32 0";
@@ -1478,6 +1479,13 @@ namespace sysy
         std::vector<std::string> argValues;
         std::vector<std::string> argTypes;
         
+        // 获取系统函数的参数类型（如果是系统函数）
+        std::vector<std::string> sysFuncParamTypes;
+        if (isSystemFunc)
+        {
+            sysFuncParamTypes = getSystemFunctionParamTypes(node->ident);
+        }
+        
         for (size_t i = 0; i < node->args.size(); ++i)
         {
             node->args[i]->accept(this);
@@ -1485,8 +1493,14 @@ namespace sysy
             
             // 确定参数类型
             std::string paramType = "i32";  // 默认类型
-            if (funcEntry && i < static_cast<size_t>(funcEntry->getParameterCount()))
+            if (isSystemFunc && i < sysFuncParamTypes.size())
             {
+                // 对于系统函数，使用系统函数定义的参数类型
+                paramType = sysFuncParamTypes[i];
+            }
+            else if (funcEntry && i < static_cast<size_t>(funcEntry->getParameterCount()))
+            {
+                // 对于用户定义函数，从符号表获取参数类型
                 VariableEntry *param = funcEntry->getParameter(static_cast<int>(i));
                 if (param) {
                     ParameterEntry *paramEntry = dynamic_cast<ParameterEntry *>(param);
@@ -1918,4 +1932,53 @@ namespace sysy
         return 0;
     }
 
+    // 获取系统函数的参数类型列表
+    std::vector<std::string> CodeGenerator::getSystemFunctionParamTypes(const std::string &funcName)
+    {
+        std::vector<std::string> paramTypes;
+        
+        if (funcName == "getint" || funcName == "getch")
+        {
+            // 无参数
+        }
+        else if (funcName == "putint" || funcName == "putch")
+        {
+            paramTypes.push_back("i32");
+        }
+        else if (funcName == "getarray")
+        {
+            paramTypes.push_back("i32*");  // getarray 接收数组指针
+        }
+        else if (funcName == "putfloat")
+        {
+            paramTypes.push_back("float");
+        }
+        else if (funcName == "putarray")
+        {
+            paramTypes.push_back("i32");   // 第一个参数：数组长度
+            paramTypes.push_back("i32*");  // 第二个参数：数组指针
+        }
+        else if (funcName == "getfarray")
+        {
+            paramTypes.push_back("float*");
+        }
+        else if (funcName == "putfarray")
+        {
+            paramTypes.push_back("i32");    // 数组长度
+            paramTypes.push_back("float*"); // 数组指针
+        }
+        else if (funcName == "putf")
+        {
+            paramTypes.push_back("i8*");  // 格式字符串指针，可能有更多参数
+        }
+        else if (funcName == "_sysy_starttime" || funcName == "_sysy_stoptime")
+        {
+            paramTypes.push_back("i32");
+        }
+        
+        return paramTypes;
+    }
+
 } // namespace sysy
+
+

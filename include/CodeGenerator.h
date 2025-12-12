@@ -43,6 +43,7 @@ namespace sysy
         bool isSystemFunction(const std::string &funcName);
         DataType getSystemFunctionReturnType(const std::string &funcName);
         int getSystemFunctionParamCount(const std::string &funcName);
+        std::vector<std::string> getSystemFunctionParamTypes(const std::string &funcName);
         
         // 常量表达式求值（用于全局变量初始值）
         int evaluateConstExp(ConstExpNode* node);
