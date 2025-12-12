@@ -17,7 +17,7 @@ namespace sysy
     static std::string condResultReg;
 
     CodeGenerator::CodeGenerator(SymbolTableManager *symTabMgr)
-        : symbolTableManager(symTabMgr), labelCounter(0), currentParamIndex(0), currentBlockLabel("")
+        : symbolTableManager(symTabMgr), labelCounter(0), currentParamIndex(0), currentBlockLabel(""), inFunctionFirstBlock(false)
     {
     }
 
@@ -174,7 +174,23 @@ namespace sysy
             // 对于局部常量，可以选择生成 alloca 并标记为只读
             // 或者完全通过符号表内联（当前采用生成 alloca 的方式）
             std::string constName = "%" + node->ident;
+            
+            // 使用函数级别的计数器生成唯一名称
             if (constEntry) {
+                static std::map<SymbolTable*, std::map<std::string, int>> funcConstCounters;
+                SymbolTable* funcScope = symbolTableManager->functionTable;
+                
+                auto& constCounter = funcConstCounters[funcScope];
+                
+                if (constCounter.find(node->ident) != constCounter.end()) {
+                    int count = constCounter[node->ident];
+                    constCounter[node->ident]++;
+                    constName = "%" + node->ident + std::to_string(count);
+                } else {
+                    constCounter[node->ident] = 1;
+                    constName = "%" + node->ident;
+                }
+                
                 constEntry->irName = constName;
             }
 
@@ -279,13 +295,12 @@ namespace sysy
             // 在LLVM IR中，每个局部变量必须有唯一的名称
             std::string varName = "%" + node->ident;
             
-            // 为了避免重名（例如不同if分支中的同名变量），我们需要检查并生成唯一名称
-            // 解决方案：使用全局计数器为每个变量名生成唯一后缀
+            // 为了避免重名（例如不同作用域中的同名变量），使用函数级别的计数器
+            // 使用函数符号表指针作为函数的唯一标识
             if (varEntry) {
                 // 使用静态map记录每个变量名在当前函数中出现的次数
-                // 使用作用域指针的地址作为唯一标识
-                static std::map<void*, std::map<std::string, int>> funcVarCounters;
-                void* funcScope = symbolTableManager->getCurrentScope();
+                static std::map<SymbolTable*, std::map<std::string, int>> funcVarCounters;
+                SymbolTable* funcScope = symbolTableManager->functionTable;
                 
                 auto& varCounter = funcVarCounters[funcScope];
                 
@@ -745,14 +760,19 @@ namespace sysy
         bool hasReturn = false;
         if (node->block)
         {
-            // 遍历块项目，但不生成额外的大括号
+            // 设置标志，表示即将处理函数首块
+            inFunctionFirstBlock = true;
+            
+            // 通过 accept 调用 visitBlockStmt，这样内层块也会被正确处理
+            node->block->accept(this);
+            
+            // 检查是否有 return 语句
             for (auto &item : node->block->blockItems)
             {
-                item->accept(this);
-                // 检查最后一个语句是否为 return（简化判断）
                 if (item->stmt && dynamic_cast<ReturnStmtNode *>(item->stmt.get()))
                 {
                     hasReturn = true;
+                    break;
                 }
             }
         }
@@ -812,10 +832,24 @@ namespace sysy
 
     void CodeGenerator::visitBlockStmt(BlockStmtNode *node)
     {
+        // 使用标志判断是否为函数首块
+        bool isFirstBlockInFunc = inFunctionFirstBlock;
+        inFunctionFirstBlock = false;  // 重置标志，后续块都不是首块
+        
+        bool enteredScope = false;
+        if (!isFirstBlockInFunc) {
+            // 进入语义分析时已创建的子作用域（不创建新的）
+            enteredScope = symbolTableManager->enterExistingChildScope();
+        }
+        
         // 遍历所有块项目
         for (auto &item : node->blockItems)
         {
             item->accept(this);
+        }
+        
+        if (enteredScope) {
+            symbolTableManager->exitExistingScope();
         }
     }
 
@@ -840,21 +874,29 @@ namespace sysy
             std::string rhsValue = currentValue;
 
             // 获取左值地址
-            SymbolEntry *entry = symbolTableManager->lookup(node->lVal->ident);
+            // 查找变量，需要找到已经有 irName 的那个（已声明的）
+            SymbolEntry *entry = nullptr;
+            SymbolTable* scope = symbolTableManager->getCurrentScope();
+            while (scope != nullptr) {
+                SymbolEntry* found = scope->lookup(node->lVal->ident);
+                if (found) {
+                    VariableEntry* varFound = dynamic_cast<VariableEntry*>(found);
+                    if (varFound && !varFound->irName.empty()) {
+                        entry = found;
+                        break;
+                    }
+                }
+                scope = scope->getParent();
+            }
+            
             if (!entry) {
-                std::cerr << "Error: Variable '" << node->lVal->ident << "' not found in symbol table" << std::endl;
+                std::cerr << "Error: Variable '" << node->lVal->ident << "' not found in symbol table or has no IR name" << std::endl;
                 return;
             }
 
             VariableEntry *varEntry = dynamic_cast<VariableEntry *>(entry);
             if (!varEntry) {
                 std::cerr << "Error: '" << node->lVal->ident << "' is not a variable" << std::endl;
-                return;
-            }
-            
-            // 检查变量是否已经生成了IR名称（即是否已经定义了）
-            if (varEntry->irName.empty()) {
-                std::cerr << "Error: Variable '" << node->lVal->ident << "' has not been defined (no IR name)" << std::endl;
                 return;
             }
 
@@ -1215,10 +1257,23 @@ namespace sysy
 
     void CodeGenerator::visitLVal(LValNode *node)
     {
-        // 查找符号表条目
-        SymbolEntry *entry = symbolTableManager->lookup(node->ident);
+        // 查找符号表条目 - 需要找到已经有 irName 的那个（已声明的）
+        SymbolEntry *entry = nullptr;
+        SymbolTable* scope = symbolTableManager->getCurrentScope();
+        while (scope != nullptr) {
+            SymbolEntry* found = scope->lookup(node->ident);
+            if (found) {
+                VariableEntry* varFound = dynamic_cast<VariableEntry*>(found);
+                if (varFound && !varFound->irName.empty()) {
+                    entry = found;
+                    break;
+                }
+            }
+            scope = scope->getParent();
+        }
+        
         if (!entry) {
-            std::cerr << "Error: Variable '" << node->ident << "' not found in symbol table" << std::endl;
+            std::cerr << "Error: Variable '" << node->ident << "' not found in symbol table or has no IR name" << std::endl;
             // 设置一个默认值，避免后续代码崩溃
             currentValue = "0";
             return;
@@ -1227,14 +1282,6 @@ namespace sysy
         VariableEntry *varEntry = dynamic_cast<VariableEntry *>(entry);
         if (!varEntry) {
             std::cerr << "Error: '" << node->ident << "' is not a variable" << std::endl;
-            // 设置一个默认值，避免后续代码崩溃
-            currentValue = "0";
-            return;
-        }
-        
-        // 检查变量是否已经生成了IR名称（即是否已经定义了）
-        if (varEntry->irName.empty()) {
-            std::cerr << "Error: Variable '" << node->ident << "' has not been defined (no IR name)" << std::endl;
             // 设置一个默认值，避免后续代码崩溃
             currentValue = "0";
             return;

@@ -51,6 +51,8 @@ public:
     std::unique_ptr<SymbolTable> globalTable;
     SymbolTable* currentTable;
     SymbolTable* functionTable;  // 当前函数局部符号表
+    std::vector<size_t> childIndexStack;  // 用于遍历已存在的子作用域
+    std::unordered_map<SymbolTable*, size_t> nextChildIndexMap;  // 记录每个节点的下一个子节点索引
     
     SymbolTableManager();
     ~SymbolTableManager();
@@ -62,6 +64,10 @@ public:
     void exitFunction();
     SymbolTable* getCurrentScope() const { return currentTable; }
     SymbolTable* getGlobalScope() const { return globalTable.get(); }
+    
+    // 代码生成时遍历已存在的子作用域（不创建新作用域）
+    bool enterExistingChildScope();
+    void exitExistingScope();
     
     // 符号查找
     SymbolEntry* lookup(const std::string& name) const;

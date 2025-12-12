@@ -28,6 +28,9 @@ namespace sysy
         int currentParamIndex; // 用于跟踪当前处理的参数索引
         // 当前基本块标签（用于构造包含 phi 的短路控制流）
         std::string currentBlockLabel;
+        
+        // 标记是否在处理函数体的首块（首块不创建新作用域）
+        bool inFunctionFirstBlock;
 
         // 辅助方法
         std::string getLLVMType(DataType dataType);
