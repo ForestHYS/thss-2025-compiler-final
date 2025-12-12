@@ -26,6 +26,8 @@ namespace sysy
         std::string currentContinueTarget;
         int labelCounter;      // 用于生成唯一的标签名
         int currentParamIndex; // 用于跟踪当前处理的参数索引
+        // 当前基本块标签（用于构造包含 phi 的短路控制流）
+        std::string currentBlockLabel;
 
         // 辅助方法
         std::string getLLVMType(DataType dataType);

@@ -17,7 +17,7 @@ namespace sysy
     static std::string condResultReg;
 
     CodeGenerator::CodeGenerator(SymbolTableManager *symTabMgr)
-        : symbolTableManager(symTabMgr), labelCounter(0), currentParamIndex(0)
+        : symbolTableManager(symTabMgr), labelCounter(0), currentParamIndex(0), currentBlockLabel("")
     {
     }
 
@@ -728,6 +728,11 @@ namespace sysy
         }
         irStream << ") {\n";
 
+        // 在任何指令之前生成入口基本块标签
+        std::string entryLabel = generateLabel("entry");
+        irStream << entryLabel << ":\n";
+        currentBlockLabel = entryLabel;
+
         // 为每个参数调用visitFuncFParam处理
         currentParamIndex = 0;
         for (size_t i = 0; i < node->params.size(); ++i)
@@ -979,6 +984,7 @@ namespace sysy
 
         // then分支
         irStream << thenLabel << ":\n";
+        currentBlockLabel = thenLabel;
         if (node->thenStmt)
         {
             node->thenStmt->accept(this);
@@ -989,12 +995,14 @@ namespace sysy
         if (node->elseStmt)
         {
             irStream << elseLabel << ":\n";
+            currentBlockLabel = elseLabel;
             node->elseStmt->accept(this);
             irStream << "  br label %" << endLabel << "\n";
         }
 
         // 结束标签
         irStream << endLabel << ":\n";
+        currentBlockLabel = endLabel;
     }
 
     void CodeGenerator::visitWhileStmt(WhileStmtNode *node)
@@ -1017,6 +1025,7 @@ namespace sysy
 
         // 条件判断块
         irStream << condLabel << ":\n";
+        currentBlockLabel = condLabel;
         if (node->cond)
         {
             node->cond->accept(this);
@@ -1027,6 +1036,7 @@ namespace sysy
 
         // 循环体
         irStream << bodyLabel << ":\n";
+        currentBlockLabel = bodyLabel;
         if (node->body)
         {
             node->body->accept(this);
@@ -1035,6 +1045,7 @@ namespace sysy
 
         // 结束标签
         irStream << endLabel << ":\n";
+        currentBlockLabel = endLabel;
 
         // 恢复之前的break/continue目标
         currentBreakTarget = oldBreak;
@@ -1171,6 +1182,7 @@ namespace sysy
                 std::string extReg = "%t" + std::to_string(tempCounter++);
                 irStream << "  " << extReg << " = zext i1 " << resultReg << " to i32\n";
                 currentValue = extReg;
+                condResultReg = resultReg; // 供条件使用
             }
         }
         else if (node->primaryExp)
@@ -1556,33 +1568,48 @@ namespace sysy
             std::string cmpReg = "%t" + std::to_string(tempCounter++);
             irStream << "  " << cmpReg << " = icmp ne i32 " << currentValue << ", 0\n";
             condResultReg = cmpReg;
+            // 表达式值为 i32 0/1
+            std::string extReg = "%t" + std::to_string(tempCounter++);
+            irStream << "  " << extReg << " = zext i1 " << cmpReg << " to i32\n";
+            currentValue = extReg;
         }
         else
         {
-            // 二元操作 - 短路求值
+            // 二元操作 - 短路求值（控制流 + phi）
             node->left->accept(this);
             std::string leftVal = currentValue;
 
-            // 将左操作数转换为bool
+            // 左操作数转为 i1
             std::string leftCmp = "%t" + std::to_string(tempCounter++);
             irStream << "  " << leftCmp << " = icmp ne i32 " << leftVal << ", 0\n";
 
+            // 构造基本块
+            std::string rhsLabel = generateLabel("and.rhs");
+            std::string endLabel = generateLabel("and.end");
+            // 记录左分支所在前驱块标签，用于 phi
+            std::string lhsPred = currentBlockLabel;
+            // 依据左值进行跳转：false -> end，true -> rhs
+            irStream << "  br i1 " << leftCmp << ", label %" << rhsLabel << ", label %" << endLabel << "\n";
+
+            // 右侧块
+            irStream << rhsLabel << ":\n";
+            currentBlockLabel = rhsLabel;
             node->right->accept(this);
             std::string rightVal = currentValue;
-
-            // 将右操作数转换为bool
             std::string rightCmp = "%t" + std::to_string(tempCounter++);
             irStream << "  " << rightCmp << " = icmp ne i32 " << rightVal << ", 0\n";
+            irStream << "  br label %" << endLabel << "\n";
 
-            // 逻辑与操作
-            std::string andReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << andReg << " = and i1 " << leftCmp << ", " << rightCmp << "\n";
-
-            // 转换为i32
+            // 合并块
+            irStream << endLabel << ":\n";
+            std::string phiReg = "%t" + std::to_string(tempCounter++);
+            irStream << "  " << phiReg << " = phi i1 [ false, %" << lhsPred << " ], [ " << rightCmp << ", %" << rhsLabel << " ]\n";
+            currentBlockLabel = endLabel;
+            // 设置表达式与条件结果
             std::string extReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << extReg << " = zext i1 " << andReg << " to i32\n";
+            irStream << "  " << extReg << " = zext i1 " << phiReg << " to i32\n";
             currentValue = extReg;
-            condResultReg = andReg;
+            condResultReg = phiReg;
         }
     }
 
@@ -1596,33 +1623,46 @@ namespace sysy
             std::string cmpReg = "%t" + std::to_string(tempCounter++);
             irStream << "  " << cmpReg << " = icmp ne i32 " << currentValue << ", 0\n";
             condResultReg = cmpReg;
+            std::string extReg = "%t" + std::to_string(tempCounter++);
+            irStream << "  " << extReg << " = zext i1 " << cmpReg << " to i32\n";
+            currentValue = extReg;
         }
         else
         {
-            // 二元操作 - 短路求值
+            // 二元操作 - 短路求值（控制流 + phi）
             node->left->accept(this);
             std::string leftVal = currentValue;
 
-            // 将左操作数转换为bool
+            // 左操作数转为 i1
             std::string leftCmp = "%t" + std::to_string(tempCounter++);
             irStream << "  " << leftCmp << " = icmp ne i32 " << leftVal << ", 0\n";
 
+            // 构造基本块
+            std::string rhsLabel = generateLabel("or.rhs");
+            std::string endLabel = generateLabel("or.end");
+            // 记录左分支所在前驱块标签，用于 phi
+            std::string lhsPred = currentBlockLabel;
+            // 左值为真则直接到 end，为假则到 rhs
+            irStream << "  br i1 " << leftCmp << ", label %" << endLabel << ", label %" << rhsLabel << "\n";
+
+            // 右侧块
+            irStream << rhsLabel << ":\n";
+            currentBlockLabel = rhsLabel;
             node->right->accept(this);
             std::string rightVal = currentValue;
-
-            // 将右操作数转换为bool
             std::string rightCmp = "%t" + std::to_string(tempCounter++);
             irStream << "  " << rightCmp << " = icmp ne i32 " << rightVal << ", 0\n";
+            irStream << "  br label %" << endLabel << "\n";
 
-            // 逻辑或操作
-            std::string orReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << orReg << " = or i1 " << leftCmp << ", " << rightCmp << "\n";
-
-            // 转换为i32
+            // 合并块
+            irStream << endLabel << ":\n";
+            std::string phiReg = "%t" + std::to_string(tempCounter++);
+            irStream << "  " << phiReg << " = phi i1 [ true, %" << lhsPred << " ], [ " << rightCmp << ", %" << rhsLabel << " ]\n";
+            currentBlockLabel = endLabel;
             std::string extReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << extReg << " = zext i1 " << orReg << " to i32\n";
+            irStream << "  " << extReg << " = zext i1 " << phiReg << " to i32\n";
             currentValue = extReg;
-            condResultReg = orReg;
+            condResultReg = phiReg;
         }
     }
 
