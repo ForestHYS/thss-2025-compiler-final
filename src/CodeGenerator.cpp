@@ -1598,12 +1598,14 @@ namespace sysy
             std::string rightVal = currentValue;
             std::string rightCmp = "%t" + std::to_string(tempCounter++);
             irStream << "  " << rightCmp << " = icmp ne i32 " << rightVal << ", 0\n";
+            // 记录右侧实际前驱（可能被嵌套表达式更新）
+            std::string rightPred = currentBlockLabel;
             irStream << "  br label %" << endLabel << "\n";
 
             // 合并块
             irStream << endLabel << ":\n";
             std::string phiReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << phiReg << " = phi i1 [ false, %" << lhsPred << " ], [ " << rightCmp << ", %" << rhsLabel << " ]\n";
+            irStream << "  " << phiReg << " = phi i1 [ false, %" << lhsPred << " ], [ " << rightCmp << ", %" << rightPred << " ]\n";
             currentBlockLabel = endLabel;
             // 设置表达式与条件结果
             std::string extReg = "%t" + std::to_string(tempCounter++);
@@ -1652,12 +1654,14 @@ namespace sysy
             std::string rightVal = currentValue;
             std::string rightCmp = "%t" + std::to_string(tempCounter++);
             irStream << "  " << rightCmp << " = icmp ne i32 " << rightVal << ", 0\n";
+            // 记录右侧实际前驱（可能被嵌套表达式更新）
+            std::string rightPred = currentBlockLabel;
             irStream << "  br label %" << endLabel << "\n";
 
             // 合并块
             irStream << endLabel << ":\n";
             std::string phiReg = "%t" + std::to_string(tempCounter++);
-            irStream << "  " << phiReg << " = phi i1 [ true, %" << lhsPred << " ], [ " << rightCmp << ", %" << rhsLabel << " ]\n";
+            irStream << "  " << phiReg << " = phi i1 [ true, %" << lhsPred << " ], [ " << rightCmp << ", %" << rightPred << " ]\n";
             currentBlockLabel = endLabel;
             std::string extReg = "%t" + std::to_string(tempCounter++);
             irStream << "  " << extReg << " = zext i1 " << phiReg << " to i32\n";
